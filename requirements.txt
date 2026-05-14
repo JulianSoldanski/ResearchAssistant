@@ -1,0 +1,5 @@
+flet>=0.21
+google-genai>=1.0
+pyzotero>=1.5
+PyMuPDF>=1.24
+python-dotenv>=1.0
