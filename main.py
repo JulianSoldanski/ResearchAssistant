@@ -19,7 +19,7 @@ def main(page: ft.Page):
     active_view = ["kanban"]
     main_content = ft.Container(expand=True)
 
-    def navigate_to(view_key: str, **_):
+    def navigate_to(view_key: str):
         active_view[0] = view_key
         if view_key == "kanban":
             main_content.content = kanban.build(conn, page)
@@ -29,7 +29,6 @@ def main(page: ft.Page):
         page=page,
         conn=conn,
         on_nav=navigate_to,
-        on_sync=lambda _: navigate_to(active_view[0]),
         active_view=active_view,
     )
 

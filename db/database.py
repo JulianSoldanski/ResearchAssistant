@@ -98,10 +98,6 @@ def get_papers_by_priority(conn: sqlite3.Connection, priority_level: int) -> lis
     ).fetchall()
 
 
-def get_all_papers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM papers ORDER BY priority_level, title").fetchall()
-
-
 def get_paper_by_id(conn: sqlite3.Connection, paper_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
 

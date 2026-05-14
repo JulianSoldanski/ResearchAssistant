@@ -14,7 +14,6 @@ def build(
     page: ft.Page,
     conn: sqlite3.Connection,
     on_nav: callable,
-    on_sync: callable,
     active_view: list,  # mutable single-element list so sidebar can read current state
 ) -> ft.Container:
 
@@ -74,7 +73,10 @@ def build(
         try:
             from api import zotero_client
             added, skipped = zotero_client.sync_papers(conn)
-            sync_result_text.value = f"Synced: {added} papers."
+            msg = f"Synced: {added} papers."
+            if skipped:
+                msg += f" {skipped} skipped (unsupported type)."
+            sync_result_text.value = msg
             sync_result_text.color = ft.Colors.GREEN_300
             on_nav(active_view[0])
         except Exception as exc:

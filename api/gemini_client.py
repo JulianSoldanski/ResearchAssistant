@@ -9,7 +9,12 @@ from utils.cache import make_hash
 
 load_dotenv()
 
-MODEL_NAME = "gemini-2.0-flash"
+# (display label, model id). Order = order in the UI dropdown; first entry is default.
+AVAILABLE_MODELS: list[tuple[str, str]] = [
+    ("Flash (fast)", "gemini-3-flash-preview"),
+    ("Pro (deeper)", "gemini-3.1-pro-preview"),
+]
+DEFAULT_MODEL = AVAILABLE_MODELS[0][1]
 
 _client: genai.Client | None = None
 
@@ -25,10 +30,11 @@ def _get_client() -> genai.Client:
 
 
 def query(paper_id: int, pdf_path: str, prompt_text: str,
-          conn: sqlite3.Connection, thesis_goals: str = "") -> tuple[str, bool]:
-    """Return (response_text, from_cache)."""
+          conn: sqlite3.Connection, thesis_goals: str = "",
+          model: str = DEFAULT_MODEL) -> tuple[str, bool]:
+    """Return (response_text, from_cache). Cache is keyed by (pdf, prompt, model)."""
     pdf_text = extract_text(pdf_path)
-    prompt_hash = make_hash(pdf_text, prompt_text)
+    prompt_hash = make_hash(pdf_text, prompt_text, model)
 
     cached = db.get_cached_response(conn, paper_id, prompt_hash)
     if cached:
@@ -47,33 +53,8 @@ def query(paper_id: int, pdf_path: str, prompt_text: str,
     )
 
     client = _get_client()
-    response = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
+    response = client.models.generate_content(model=model, contents=full_prompt)
     response_text = response.text
 
-    db.save_cached_response(conn, paper_id, prompt_hash, prompt_text, response_text, MODEL_NAME)
+    db.save_cached_response(conn, paper_id, prompt_hash, prompt_text, response_text, model)
     return response_text, False
-
-
-def query_code(code_snippet: str) -> str:
-    """Analyze a code snippet without caching."""
-    system_prompt = (
-        "You are an expert software architect and code reviewer. "
-        "Analyze the provided code and produce a structured review covering:\n\n"
-        "## Architecture & Design\n"
-        "Evaluate the overall structure, separation of concerns, and design patterns used.\n\n"
-        "## Edge Cases & Bugs\n"
-        "Identify potential edge cases, off-by-one errors, null/None handling, and actual bugs.\n\n"
-        "## Security Issues\n"
-        "Flag any security vulnerabilities such as injection risks, improper validation, or "
-        "exposure of sensitive data.\n\n"
-        "## Improvements\n"
-        "Suggest concrete, prioritized improvements with brief code examples where helpful.\n\n"
-        "## Summary\n"
-        "A one-paragraph summary verdict on the code quality."
-    )
-
-    full_prompt = f"{system_prompt}\n\n---\n\nCode to review:\n\n```\n{code_snippet}\n```"
-
-    client = _get_client()
-    response = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
-    return response.text

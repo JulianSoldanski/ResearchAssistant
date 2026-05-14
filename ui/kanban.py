@@ -13,11 +13,26 @@ COLUMNS = [
 ]
 
 PROMPT_TEMPLATES = [
-    ("Summarize key findings", "Summarize the key findings and main conclusions of this paper in detail."),
-    ("Analyze methodology", "Analyze the research methodology and design of this paper. What methods were used, how was the study designed, and how valid are the results?"),
-    ("Extract key concepts", "Extract and explain the key concepts, theories, and definitions introduced or used in this paper."),
-    ("Limitations & future work", "Identify the limitations of this study and the directions for future work mentioned by the authors."),
-    ("Relate to thesis goals", "Based on my core thesis goals provided above, explain how this paper is relevant to my research. What can I directly use or cite?"),
+    (
+        "Summarize key findings",
+        "Act as an expert academic researcher. Summarize the key findings and main conclusions of this paper. Use a structured format with the following bolded headings: 1. Core Problem, 2. Main Hypothesis, 3. Key Results (extract specific quantitative metrics or data points), and 4. Overall Conclusion. Be highly concise and avoid filler words."
+    ),
+    (
+        "Analyze methodology",
+        "Act as a critical peer reviewer. Analyze the research methodology and design of this paper. Structure your response into: 1. Experimental Setup/Design, 2. Datasets/Sample Size, 3. Variables & Controls, and 4. Validity Assessment. In the validity section, evaluate the robustness of the methods and point out any potential biases."
+    ),
+    (
+        "Extract key concepts",
+        "Identify the core theoretical concepts, frameworks, and specific definitions introduced or heavily utilized in this paper. Format the output as a structured academic glossary: use bolded terms followed by clear, precise definitions based strictly on the provided text. Do not invent external definitions."
+    ),
+    (
+        "Limitations & future work",
+        "Extract the limitations and future research directions explicitly stated by the authors. Format these as two separate bulleted lists. Afterward, briefly act as a critical reviewer and suggest one additional potential limitation or confounding variable that the authors might have overlooked."
+    ),
+    (
+        "Relate to thesis goals",
+        "Act as my academic advisor. Using my core thesis goals provided in the system prompt, evaluate this paper's direct relevance. Provide: 1. A brief explanation of how the paper aligns with my goals, 2. Specific arguments, methodologies, or data points I can directly cite, and 3. How this paper either supports or challenges my core thesis hypothesis."
+    ),
     ("Custom query", None),
 ]
 
@@ -119,7 +134,18 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             options=template_options,
             value=PROMPT_TEMPLATES[0][0],
             text_size=13,
+            expand=True,
             on_select=lambda e: _on_template_change(e.control.value),
+        )
+
+        from api import gemini_client as _gc
+        model_dropdown = ft.Dropdown(
+            label="Model",
+            options=[ft.DropdownOption(key=mid, text=label)
+                     for label, mid in _gc.AVAILABLE_MODELS],
+            value=_gc.DEFAULT_MODEL,
+            text_size=13,
+            width=180,
         )
 
         custom_field = ft.TextField(
@@ -177,16 +203,27 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             cache_badge.value = ""
             page.update()
 
+            selected_model = model_dropdown.value or _gc.DEFAULT_MODEL
+            model_label = next(
+                (label for label, mid in _gc.AVAILABLE_MODELS if mid == selected_model),
+                selected_model,
+            )
+
             def run():
                 try:
                     from api import gemini_client
                     thesis_goals = db.get_setting(conn, "thesis_goals", "")
                     response, from_cache = gemini_client.query(
-                        pid, paper["local_file_path"], prompt_text, conn, thesis_goals
+                        pid, paper["local_file_path"], prompt_text, conn,
+                        thesis_goals, selected_model,
                     )
                     output_md.value = response
-                    cache_badge.value = "⚡ From cache" if from_cache else "🌐 From Gemini API"
-                    cache_badge.color = ft.Colors.GREEN_300 if from_cache else ft.Colors.BLUE_300
+                    if from_cache:
+                        cache_badge.value = f"⚡ From cache ({model_label})"
+                        cache_badge.color = ft.Colors.GREEN_300
+                    else:
+                        cache_badge.value = f"🌐 From Gemini API ({model_label})"
+                        cache_badge.color = ft.Colors.BLUE_300
                 except Exception as exc:
                     output_md.value = f"**Error:** {exc}"
                     cache_badge.value = ""
@@ -227,7 +264,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                 [
                     ft.Text("AI Analysis", size=12, color=ft.Colors.BLUE_GREY_400,
                             weight=ft.FontWeight.W_500),
-                    ft.Row([prompt_dropdown], expand=True),
+                    ft.Row([prompt_dropdown, model_dropdown], spacing=8),
                     custom_field,
                     ft.Row(
                         [
