@@ -1,6 +1,6 @@
 import flet as ft
 from db import database as db
-from ui import sidebar, kanban
+from ui import sidebar, kanban, cross_search, thesis, settings
 
 
 def main(page: ft.Page):
@@ -16,6 +16,13 @@ def main(page: ft.Page):
     conn = db.get_connection()
     db.init_db(conn)
 
+    # Shared services. In Flet 0.85, FilePicker and Clipboard are Services
+    # (not Controls) — they go in page.services, not page.overlay.
+    page.file_picker = ft.FilePicker()
+    page.clipboard_service = ft.Clipboard()
+    page.services.append(page.file_picker)
+    page.services.append(page.clipboard_service)
+
     active_view = ["kanban"]
     main_content = ft.Container(expand=True)
 
@@ -23,6 +30,12 @@ def main(page: ft.Page):
         active_view[0] = view_key
         if view_key == "kanban":
             main_content.content = kanban.build(conn, page)
+        elif view_key == "search":
+            main_content.content = cross_search.build(conn, page)
+        elif view_key == "thesis":
+            main_content.content = thesis.build(conn, page)
+        elif view_key == "settings":
+            main_content.content = settings.build(conn, page)
         page.update()
 
     sidebar_widget = sidebar.build(
@@ -45,4 +58,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)

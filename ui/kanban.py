@@ -1,8 +1,14 @@
-import threading
+import shutil
 import subprocess
+import threading
+from pathlib import Path
+
 import flet as ft
 import sqlite3
 from db import database as db
+
+# Uploaded PDFs live alongside the SQLite DB, namespaced by paper id
+_UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 
 COLUMNS = [
     (0, "Trash", ft.Icons.DELETE_OUTLINE, ft.Colors.GREY_700),
@@ -15,7 +21,7 @@ COLUMNS = [
 PROMPT_TEMPLATES = [
     (
         "Summarize key findings",
-        "Act as an expert academic researcher. Summarize the key findings and main conclusions of this paper. Use a structured format with the following bolded headings: 1. Core Problem, 2. Main Hypothesis, 3. Key Results (extract specific quantitative metrics or data points), and 4. Overall Conclusion. Be highly concise and avoid filler words."
+        "Act as an expert academic researcher. Summarize the key findings and main conclusions of this paper. Use a structured format with the following bolded headings: 1. Core Problem, 2. Main Research Questions & Hypotheses, 3. Key Results (extract specific quantitative metrics or data points), and 4. Overall Conclusion. Be highly concise and avoid filler words."
     ),
     (
         "Analyze methodology",
@@ -44,8 +50,70 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         board_ref.current.controls = _build_columns()
         page.update()
 
+    # Tracks which paper's detail dialog is open (None = no dialog).
+    # Read by the page-level keyboard handler to navigate Arrow keys.
+    # `update_tag` is a callback the open dialog registers, so Arrow Left/Right
+    # can refresh the lane badge without rebuilding the whole dialog.
+    open_paper_state: dict = {"pid": None, "level": None, "update_tag": None}
+
+    def _navigate_lane(direction: int):
+        """direction: +1 = next paper in lane, -1 = previous. Wraps around."""
+        pid = open_paper_state["pid"]
+        level = open_paper_state["level"]
+        if pid is None or level is None:
+            return
+        papers = db.get_papers_by_priority(conn, level)
+        if not papers:
+            return
+        ids = [p["id"] for p in papers]
+        try:
+            idx = ids.index(pid)
+        except ValueError:
+            return
+        next_paper = dict(papers[(idx + direction) % len(ids)])
+        page.pop_dialog()
+        _show_paper_detail(next_paper)
+
+    def _move_open_paper(direction: int):
+        """direction: -1 = move to lane on the left, +1 = right. Clamped."""
+        pid = open_paper_state["pid"]
+        level = open_paper_state["level"]
+        if pid is None or level is None:
+            return
+        new_level = max(0, min(4, level + direction))
+        if new_level == level:
+            return
+        db.set_priority(conn, pid, new_level)
+        open_paper_state["level"] = new_level
+        if open_paper_state["update_tag"]:
+            open_paper_state["update_tag"](new_level)
+        refresh()  # board re-renders the card in its new column
+
+    def _on_key(e):
+        if open_paper_state["pid"] is None:
+            return
+        key = e.key
+        if key in ("Arrow Down", "ArrowDown"):
+            _navigate_lane(+1)
+        elif key in ("Arrow Up", "ArrowUp"):
+            _navigate_lane(-1)
+        elif key in ("Arrow Right", "ArrowRight"):
+            _move_open_paper(+1)
+        elif key in ("Arrow Left", "ArrowLeft"):
+            _move_open_paper(-1)
+
+    page.on_keyboard_event = _on_key
+
+    def _lane_for_level(level):
+        for lv, label, icon, color in COLUMNS:
+            if lv == level:
+                return label, icon, color
+        return "?", ft.Icons.HELP_OUTLINE, ft.Colors.GREY_700
+
     def _show_paper_detail(paper: dict):
         pid = paper["id"]
+        open_paper_state["pid"] = pid
+        open_paper_state["level"] = paper.get("priority_level")
 
         notes_field = ft.TextField(
             label="Why is this paper relevant?",
@@ -157,13 +225,100 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             text_size=13,
         )
 
-        cache_badge = ft.Text("", size=11, italic=True)
-        output_md = ft.Markdown(
-            value="*Select a prompt and click Analyze.*",
-            selectable=True,
-            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-            expand=True,
-        )
+        analyses_list = ft.Column([], spacing=8, scroll=ft.ScrollMode.AUTO, expand=True)
+
+        def _label_for_prompt(prompt_text: str) -> str:
+            for name, text in PROMPT_TEMPLATES:
+                if text is not None and text == prompt_text:
+                    return name
+            return "Custom query"
+
+        def _label_for_model(model_id: str) -> str:
+            for label, mid in _gc.AVAILABLE_MODELS:
+                if mid == model_id:
+                    return label
+            return model_id or "unknown"
+
+        def _make_analysis_tile(row) -> ft.Container:
+            aid = row["id"]
+            response = row["generated_response"] or ""
+            label = _label_for_prompt(row["prompt_text"] or "")
+            model_label = _label_for_model(row["model_used"] or "")
+            created_at = row["created_at"] or ""
+
+            lines = response.splitlines()
+            preview = "\n".join(lines[:5])
+            if len(lines) > 5 or len(preview) < len(response):
+                preview = preview.rstrip() + " …"
+
+            preview_md = ft.Markdown(
+                value=preview, selectable=False,
+                extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+            )
+            full_md = ft.Markdown(
+                value=response, selectable=True,
+                extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                visible=False,
+            )
+            expand_icon = ft.Icon(ft.Icons.EXPAND_MORE, size=18,
+                                  color=ft.Colors.BLUE_GREY_300)
+            state = {"open": False}
+
+            def _toggle(_):
+                state["open"] = not state["open"]
+                preview_md.visible = not state["open"]
+                full_md.visible = state["open"]
+                expand_icon.name = (ft.Icons.EXPAND_LESS if state["open"]
+                                    else ft.Icons.EXPAND_MORE)
+                page.update()
+
+            def _delete(_):
+                db.delete_analysis(conn, aid)
+                _refresh_analyses()
+
+            header = ft.Container(
+                on_click=_toggle,
+                ink=True,
+                padding=ft.Padding(left=10, right=8, top=8, bottom=8),
+                content=ft.Row([
+                    ft.Column([
+                        ft.Text(label, size=12, weight=ft.FontWeight.W_600,
+                                color=ft.Colors.WHITE),
+                        ft.Text(f"{created_at} · {model_label}", size=10,
+                                color=ft.Colors.BLUE_GREY_400),
+                    ], spacing=2, tight=True, expand=True),
+                    expand_icon,
+                    ft.IconButton(
+                        icon=ft.Icons.DELETE_OUTLINE, icon_size=16,
+                        tooltip="Delete this analysis",
+                        on_click=_delete,
+                    ),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            )
+
+            body = ft.Container(
+                padding=ft.Padding(left=10, right=10, top=0, bottom=10),
+                content=ft.Column([preview_md, full_md], spacing=0),
+            )
+
+            return ft.Container(
+                bgcolor=ft.Colors.BLUE_GREY_700,
+                border_radius=6,
+                content=ft.Column([header, body], spacing=0, tight=True),
+            )
+
+        def _refresh_analyses():
+            analyses_list.controls.clear()
+            rows = db.get_analyses_for_paper(conn, pid)
+            if not rows:
+                analyses_list.controls.append(
+                    ft.Text("No analyses yet. Pick a prompt and click Analyze.",
+                            size=11, italic=True, color=ft.Colors.BLUE_GREY_500)
+                )
+            else:
+                for r in rows:
+                    analyses_list.controls.append(_make_analysis_tile(r))
+            page.update()
 
         busy_ring = ft.ProgressRing(width=20, height=20, visible=False)
         analyze_btn = ft.ElevatedButton(
@@ -171,7 +326,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             icon=ft.Icons.PSYCHOLOGY,
             on_click=lambda _: _do_analyze(),
         )
-        info_text = ft.Text("", size=11, color=ft.Colors.RED_300)
+        info_text = ft.Text("", size=11, color=ft.Colors.BLUE_GREY_400, italic=True)
 
         def _on_template_change(value: str):
             custom_field.visible = (value == "Custom query")
@@ -196,37 +351,28 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                 page.update()
                 return
 
-            info_text.value = ""
+            info_text.value = "Analyzing…"
+            info_text.color = ft.Colors.BLUE_GREY_400
             analyze_btn.disabled = True
             busy_ring.visible = True
-            output_md.value = "*Analyzing…*"
-            cache_badge.value = ""
             page.update()
 
             selected_model = model_dropdown.value or _gc.DEFAULT_MODEL
-            model_label = next(
-                (label for label, mid in _gc.AVAILABLE_MODELS if mid == selected_model),
-                selected_model,
-            )
 
             def run():
                 try:
                     from api import gemini_client
-                    thesis_goals = db.get_setting(conn, "thesis_goals", "")
-                    response, from_cache = gemini_client.query(
+                    thesis_context = db.get_thesis_context(conn)
+                    _response, from_cache = gemini_client.query(
                         pid, paper["local_file_path"], prompt_text, conn,
-                        thesis_goals, selected_model,
+                        thesis_context, selected_model,
                     )
-                    output_md.value = response
-                    if from_cache:
-                        cache_badge.value = f"⚡ From cache ({model_label})"
-                        cache_badge.color = ft.Colors.GREEN_300
-                    else:
-                        cache_badge.value = f"🌐 From Gemini API ({model_label})"
-                        cache_badge.color = ft.Colors.BLUE_300
+                    info_text.value = "⚡ Loaded from cache." if from_cache else "🌐 Saved."
+                    info_text.color = ft.Colors.GREEN_300
+                    _refresh_analyses()
                 except Exception as exc:
-                    output_md.value = f"**Error:** {exc}"
-                    cache_badge.value = ""
+                    info_text.value = f"Error: {exc}"
+                    info_text.color = ft.Colors.RED_300
                 finally:
                     analyze_btn.disabled = False
                     busy_ring.visible = False
@@ -235,6 +381,58 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             threading.Thread(target=run, daemon=True).start()
 
         has_pdf = bool(paper.get("local_file_path"))
+
+        def _open_pdf(_=None):
+            if paper.get("local_file_path"):
+                subprocess.run(["open", paper["local_file_path"]], check=False)
+
+        open_pdf_btn = ft.ElevatedButton(
+            content="Open PDF",
+            icon=ft.Icons.OPEN_IN_NEW,
+            on_click=_open_pdf,
+            visible=has_pdf,
+        )
+        upload_pdf_btn = ft.ElevatedButton(
+            content="Upload PDF",
+            icon=ft.Icons.UPLOAD_FILE,
+            visible=not has_pdf,
+            tooltip="No PDF linked. Pick one from disk to attach.",
+        )
+
+        async def _do_upload(_):
+            fp = getattr(page, "file_picker", None)
+            if fp is None:
+                info_text.value = "File picker not available."
+                info_text.color = ft.Colors.RED_300
+                page.update()
+                return
+            try:
+                files = await fp.pick_files(
+                    dialog_title="Select PDF for this paper",
+                    allowed_extensions=["pdf"],
+                    allow_multiple=False,
+                )
+                if not files:
+                    return
+                src = Path(files[0].path)
+                dest_dir = _UPLOADS_DIR / str(pid)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / src.name
+                shutil.copy2(src, dest)
+                new_path = str(dest.resolve())
+                db.set_paper_pdf_path(conn, pid, new_path)
+                paper["local_file_path"] = new_path
+                open_pdf_btn.visible = True
+                upload_pdf_btn.visible = False
+                info_text.value = f"✓ PDF attached: {src.name}"
+                info_text.color = ft.Colors.GREEN_300
+            except Exception as exc:
+                info_text.value = f"Upload failed: {exc}"
+                info_text.color = ft.Colors.RED_300
+            finally:
+                page.update()
+
+        upload_pdf_btn.on_click = _do_upload
 
         left_panel = ft.Container(
             width=340,
@@ -267,29 +465,15 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                     ft.Row([prompt_dropdown, model_dropdown], spacing=8),
                     custom_field,
                     ft.Row(
-                        [
-                            analyze_btn,
-                            ft.ElevatedButton(
-                                content="Open PDF",
-                                icon=ft.Icons.OPEN_IN_NEW,
-                                on_click=lambda _: subprocess.run(
-                                    ["open", paper["local_file_path"]], check=False
-                                ),
-                                disabled=not has_pdf,
-                            ),
-                            busy_ring,
-                        ],
+                        [analyze_btn, open_pdf_btn, upload_pdf_btn, busy_ring],
                         alignment=ft.MainAxisAlignment.START,
                         spacing=8,
                     ),
                     info_text,
-                    ft.Row([
-                        ft.Text("Output", size=12, color=ft.Colors.BLUE_GREY_400,
-                                weight=ft.FontWeight.W_500),
-                        cache_badge,
-                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                     ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
-                    ft.Column([output_md], scroll=ft.ScrollMode.AUTO, expand=True),
+                    ft.Text("Saved Analyses", size=12, color=ft.Colors.BLUE_GREY_400,
+                            weight=ft.FontWeight.W_500),
+                    analyses_list,
                 ],
                 expand=True,
                 spacing=6,
@@ -301,21 +485,72 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         subtitle = ", ".join(p for p in [authors, year] if p)
 
         def _close(_=None):
+            open_paper_state["pid"] = None
+            open_paper_state["level"] = None
+            open_paper_state["update_tag"] = None
             page.pop_dialog()
             page.update()
+
+        title_value = paper.get("title") or "Untitled"
+
+        async def _copy_title(_):
+            clip = getattr(page, "clipboard_service", None)
+            if clip is None:
+                info_text.value = "Clipboard not available."
+                info_text.color = ft.Colors.RED_300
+                page.update()
+                return
+            try:
+                await clip.set(title_value)
+                info_text.value = "✓ Title copied to clipboard."
+                info_text.color = ft.Colors.GREEN_300
+            except Exception as exc:
+                info_text.value = f"Copy failed: {exc}"
+                info_text.color = ft.Colors.RED_300
+            page.update()
+
+        # Lane tag (colored pill showing which Kanban column this paper is in)
+        lane_label, lane_icon, lane_color = _lane_for_level(paper.get("priority_level"))
+        lane_icon_ctrl = ft.Icon(lane_icon, size=14, color=ft.Colors.WHITE)
+        lane_label_ctrl = ft.Text(lane_label, size=11, weight=ft.FontWeight.BOLD,
+                                  color=ft.Colors.WHITE)
+        lane_tag = ft.Container(
+            bgcolor=lane_color,
+            border_radius=12,
+            padding=ft.Padding(left=10, right=12, top=4, bottom=4),
+            content=ft.Row([lane_icon_ctrl, lane_label_ctrl],
+                           spacing=6, tight=True,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+
+        def _update_lane_tag(new_level: int):
+            label, icon, color = _lane_for_level(new_level)
+            lane_icon_ctrl.name = icon
+            lane_label_ctrl.value = label
+            lane_tag.bgcolor = color
+            page.update()
+
+        open_paper_state["update_tag"] = _update_lane_tag
 
         title_row = ft.Row(
             [
                 ft.Column(
                     [
-                        ft.Text(paper.get("title") or "Untitled", size=15,
-                                weight=ft.FontWeight.BOLD,
+                        ft.Row([lane_tag], tight=True),
+                        ft.Text(title_value, size=15,
+                                weight=ft.FontWeight.BOLD, selectable=True,
                                 max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(subtitle, size=11, color=ft.Colors.BLUE_GREY_400),
+                        ft.Text(subtitle, size=11, color=ft.Colors.BLUE_GREY_400,
+                                selectable=True),
                     ],
-                    spacing=2,
+                    spacing=4,
                     expand=True,
                     tight=True,
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.CONTENT_COPY,
+                    tooltip="Copy title",
+                    on_click=_copy_title,
                 ),
                 ft.IconButton(
                     icon=ft.Icons.CLOSE,
@@ -347,31 +582,22 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
 
         page.show_dialog(dialog)
         _refresh_comments()
+        _refresh_analyses()
 
-    def _paper_card(paper: sqlite3.Row) -> ft.Card:
+    def _paper_card(paper: sqlite3.Row) -> ft.Draggable:
         pid = paper["id"]
-        level = paper["priority_level"]
         title = paper["title"] or "Untitled"
         authors = paper["authors"] or ""
         year = str(paper["year"]) if paper["year"] else ""
 
         subtitle_parts = [p for p in [authors[:40] + ("…" if len(authors) > 40 else ""), year] if p]
-
-        def move_left(e):
-            e.control.disabled = True
-            db.set_priority(conn, pid, level - 1)
-            refresh()
-
-        def move_right(e):
-            e.control.disabled = True
-            db.set_priority(conn, pid, level + 1)
-            refresh()
+        subtitle = ", ".join(subtitle_parts)
 
         def open_detail(_):
             fresh = db.get_paper_by_id(conn, pid)
             _show_paper_detail(dict(fresh))
 
-        return ft.Card(
+        card = ft.Card(
             content=ft.Container(
                 padding=ft.Padding(left=10, right=10, top=8, bottom=8),
                 on_click=open_detail,
@@ -380,27 +606,9 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                     [
                         ft.Text(title, size=12, weight=ft.FontWeight.W_600,
                                 max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(", ".join(subtitle_parts), size=10,
+                        ft.Text(subtitle, size=10,
                                 color=ft.Colors.BLUE_GREY_300, max_lines=1,
                                 overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Row(
-                            [
-                                ft.IconButton(
-                                    icon=ft.Icons.CHEVRON_LEFT, icon_size=16,
-                                    tooltip="Move left",
-                                    disabled=(level <= 0),
-                                    on_click=move_left,
-                                ),
-                                ft.IconButton(
-                                    icon=ft.Icons.CHEVRON_RIGHT, icon_size=16,
-                                    tooltip="Move right",
-                                    disabled=(level >= 4),
-                                    on_click=move_right,
-                                ),
-                            ],
-                            spacing=0,
-                            alignment=ft.MainAxisAlignment.END,
-                        ),
                     ],
                     spacing=2,
                     tight=True,
@@ -410,9 +618,83 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             margin=ft.Margin(left=0, top=0, right=0, bottom=6),
         )
 
+        # Compact preview shown under the cursor while dragging
+        feedback = ft.Container(
+            width=240,
+            bgcolor=ft.Colors.BLUE_GREY_700,
+            border_radius=6,
+            padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+            content=ft.Text(title, size=12, weight=ft.FontWeight.W_600,
+                            color=ft.Colors.WHITE,
+                            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+            opacity=0.9,
+        )
+
+        # The card stays visible (faded) in its original spot while being dragged
+        ghost = ft.Container(opacity=0.3, content=card)
+
+        return ft.Draggable(
+            group="paper",
+            data=str(pid),
+            content=card,
+            content_when_dragging=ghost,
+            content_feedback=feedback,
+            # Only start dragging on horizontal motion so vertical scrolling
+            # of the column still works when the cursor is over a card.
+            affinity=ft.Axis.HORIZONTAL,
+        )
+
     def _build_column(level: int, label: str, icon, color) -> ft.Container:
         papers = db.get_papers_by_priority(conn, level)
         cards = [_paper_card(p) for p in papers]
+
+        body = ft.Container(
+            bgcolor=ft.Colors.BLUE_GREY_800,
+            border_radius=ft.BorderRadius(top_left=0, top_right=0,
+                                          bottom_left=8, bottom_right=8),
+            padding=ft.Padding(left=8, right=8, top=8, bottom=8),
+            expand=True,
+            content=ft.Column(
+                cards if cards else [
+                    ft.Text("Drop papers here", size=11,
+                            color=ft.Colors.BLUE_GREY_500, italic=True)
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                spacing=0,
+                expand=True,
+            ),
+        )
+
+        def _on_will_accept(e):
+            body.bgcolor = ft.Colors.BLUE_GREY_700
+            page.update()
+
+        def _on_leave(e):
+            body.bgcolor = ft.Colors.BLUE_GREY_800
+            page.update()
+
+        def _on_accept(e):
+            body.bgcolor = ft.Colors.BLUE_GREY_800
+            src = page.get_control(e.src_id)
+            if src is not None and getattr(src, "data", None):
+                try:
+                    pid = int(src.data)
+                except (TypeError, ValueError):
+                    page.update()
+                    return
+                paper = db.get_paper_by_id(conn, pid)
+                if paper and paper["priority_level"] != level:
+                    db.set_priority(conn, pid, level)
+            refresh()
+
+        drop_target = ft.DragTarget(
+            group="paper",
+            content=body,
+            on_will_accept=_on_will_accept,
+            on_leave=_on_leave,
+            on_accept=_on_accept,
+            expand=True,
+        )
 
         return ft.Container(
             expand=True,
@@ -430,22 +712,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                             ft.Text(f"({len(papers)})", size=11, color=ft.Colors.WHITE70),
                         ], spacing=6),
                     ),
-                    ft.Container(
-                        bgcolor=ft.Colors.BLUE_GREY_800,
-                        border_radius=ft.BorderRadius(top_left=0, top_right=0,
-                                                      bottom_left=8, bottom_right=8),
-                        padding=ft.Padding(left=8, right=8, top=8, bottom=8),
-                        expand=True,
-                        content=ft.Column(
-                            cards if cards else [
-                                ft.Text("No papers", size=11,
-                                        color=ft.Colors.BLUE_GREY_500, italic=True)
-                            ],
-                            scroll=ft.ScrollMode.AUTO,
-                            spacing=0,
-                            expand=True,
-                        ),
-                    ),
+                    drop_target,
                 ],
                 spacing=0,
                 expand=True,
@@ -469,7 +736,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             [
                 ft.Text("Kanban Priority Board", size=18,
                         weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
-                ft.Text("Click a card to open notes and AI analysis. Use arrows to move between stages.",
+                ft.Text("Drag cards between columns to re-prioritize. Click a card to open notes and AI analysis.",
                         size=12, color=ft.Colors.BLUE_GREY_400),
                 board,
             ],

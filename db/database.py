@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -47,6 +48,15 @@ def init_db(conn: sqlite3.Connection) -> None:
             comment_text TEXT NOT NULL,
             created_at   TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS searches (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            raw_query       TEXT,
+            optimized_query TEXT NOT NULL,
+            paper_ids       TEXT NOT NULL,   -- JSON array of paper IDs
+            response        TEXT NOT NULL,
+            created_at      TEXT DEFAULT (datetime('now'))
+        );
     """)
     # Migrate existing databases that predate the notes column
     try:
@@ -74,19 +84,29 @@ def upsert_paper(conn: sqlite3.Connection, zotero_id: str, title: str,
             title           = excluded.title,
             authors         = excluded.authors,
             year            = excluded.year,
-            local_file_path = excluded.local_file_path,
+
+            local_file_path = COALESCE(excluded.local_file_path, papers.local_file_path),
             updated_at      = datetime('now')
     """, (zotero_id, title, authors, year, local_file_path, initial_priority))
     conn.commit()
 
 
+def set_paper_pdf_path(conn: sqlite3.Connection, paper_id: int, pdf_path: str) -> None:
+    conn.execute(
+        "UPDATE papers SET local_file_path = ?, updated_at = datetime('now') WHERE id = ?",
+        (pdf_path, paper_id)
+    )
+    conn.commit()
+
+
 def reset_database(conn: sqlite3.Connection) -> None:
-    """Clear all papers, comments, and AI cache. Settings (thesis goals) preserved."""
+    """Clear all papers, comments, AI cache, and saved searches. Settings preserved."""
     conn.executescript("""
         DELETE FROM comments;
+        DELETE FROM searches;
         DELETE FROM ai_cache;
         DELETE FROM papers;
-        DELETE FROM sqlite_sequence WHERE name IN ('papers', 'comments', 'ai_cache');
+        DELETE FROM sqlite_sequence WHERE name IN ('papers', 'comments', 'ai_cache', 'searches');
     """)
     conn.commit()
 
@@ -141,6 +161,29 @@ def delete_comment(conn: sqlite3.Connection, comment_id: int) -> None:
     conn.commit()
 
 
+# --- Searches (cross-paper search history) ---
+
+def save_search(conn: sqlite3.Connection, raw_query: str, optimized_query: str,
+                paper_ids: list[int], response: str) -> int:
+    cur = conn.execute("""
+        INSERT INTO searches (raw_query, optimized_query, paper_ids, response)
+        VALUES (?, ?, ?, ?)
+    """, (raw_query, optimized_query, json.dumps(paper_ids), response))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_all_searches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM searches ORDER BY created_at DESC"
+    ).fetchall()
+
+
+def delete_search(conn: sqlite3.Connection, search_id: int) -> None:
+    conn.execute("DELETE FROM searches WHERE id = ?", (search_id,))
+    conn.commit()
+
+
 # --- AI Cache ---
 
 def get_cached_response(conn: sqlite3.Connection, paper_id: int, prompt_hash: str) -> str | None:
@@ -161,6 +204,19 @@ def save_cached_response(conn: sqlite3.Connection, paper_id: int, prompt_hash: s
     conn.commit()
 
 
+def get_analyses_for_paper(conn: sqlite3.Connection, paper_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, prompt_text, generated_response, model_used, created_at "
+        "FROM ai_cache WHERE paper_id = ? ORDER BY created_at DESC",
+        (paper_id,)
+    ).fetchall()
+
+
+def delete_analysis(conn: sqlite3.Connection, analysis_id: int) -> None:
+    conn.execute("DELETE FROM ai_cache WHERE id = ?", (analysis_id,))
+    conn.commit()
+
+
 # --- Settings ---
 
 def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -174,3 +230,38 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
         (key, value)
     )
     conn.commit()
+
+
+# Mirrors the SECTIONS list in ui/thesis.py (label + setting key).
+# Used to build the AI system-context block from the user's thesis description.
+_THESIS_SECTIONS = [
+    ("Problem", "thesis_problem"),
+    ("Research Questions", "thesis_research_questions"),
+    ("Methodology", "thesis_methodology"),
+    ("Rough Outline", "thesis_outline"),
+    ("Data Management Plan", "thesis_data_management"),
+]
+
+
+def get_thesis_context(conn: sqlite3.Connection) -> str:
+    """Assemble all non-empty thesis sections plus the optional writing-style
+    sample into a single context block suitable for prepending to AI prompts.
+    Empty sections are omitted.
+    """
+    parts = []
+    for label, key in _THESIS_SECTIONS:
+        val = get_setting(conn, key, "").strip()
+        if val:
+            parts.append(f"## {label}\n{val}")
+
+    style = get_setting(conn, "writing_style", "").strip()
+    if style:
+        parts.append(
+            "## Writing Style\n"
+            "Match the tone, vocabulary, and sentence structure of the "
+            "following sample(s) in your response. Do NOT echo the sample "
+            "back — only imitate the style.\n\n"
+            f"```\n{style}\n```"
+        )
+
+    return "\n\n".join(parts)

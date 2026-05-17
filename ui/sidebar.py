@@ -7,6 +7,9 @@ SIDEBAR_WIDTH = 260
 
 NAV_ITEMS = [
     ("Kanban Board", "kanban", ft.Icons.VIEW_KANBAN),
+    ("Cross-Paper Search", "search", ft.Icons.SEARCH),
+    ("Thesis", "thesis", ft.Icons.DESCRIPTION),
+    ("Settings", "settings", ft.Icons.SETTINGS),
 ]
 
 
@@ -16,19 +19,6 @@ def build(
     on_nav: callable,
     active_view: list,  # mutable single-element list so sidebar can read current state
 ) -> ft.Container:
-
-    thesis_goals_field = ft.TextField(
-        label="Core Thesis Goals",
-        multiline=True,
-        min_lines=5,
-        max_lines=10,
-        value=db.get_setting(conn, "thesis_goals", ""),
-        hint_text="Describe your thesis goals here...",
-        on_change=lambda e: db.set_setting(conn, "thesis_goals", e.control.value),
-        expand=False,
-        text_size=13,
-        border_color=ft.Colors.BLUE_200,
-    )
 
     def nav_button(label: str, view_key: str, icon) -> ft.TextButton:
         def on_click(_):
@@ -123,7 +113,7 @@ def build(
             title=ft.Text("Reset database?"),
             content=ft.Text(
                 "This deletes all papers, comments, and AI cache from the local "
-                "database. Your thesis goals are kept. Zotero is NOT touched. "
+                "database. Your thesis description is kept. Zotero is NOT touched. "
                 "Re-sync afterwards to repopulate.",
                 size=13,
             ),
@@ -183,10 +173,6 @@ def build(
                 push_button,
                 reset_button,
                 sync_result_text,
-                ft.Divider(height=1, color=ft.Colors.BLUE_GREY_700),
-                ft.Text("Core Thesis Goals", size=11, color=ft.Colors.BLUE_GREY_400,
-                        weight=ft.FontWeight.W_500),
-                thesis_goals_field,
             ],
             spacing=8,
             scroll=ft.ScrollMode.AUTO,

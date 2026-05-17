@@ -132,6 +132,46 @@ def _build_priority_collection_map(zot: zotero.Zotero) -> dict[str, int]:
     return mapping
 
 
+def _ensure_priority_collections(zot: zotero.Zotero) -> dict[str, str]:
+    """Make sure the 5 priority sub-collections exist in Zotero, creating any
+    that are missing. Returns {collection_name: key} for all 5.
+    """
+    name_to_key: dict[str, str] = {}
+    for c in zot.collections():
+        name = c.get("data", {}).get("name", "")
+        if name in COLLECTION_NAMES:
+            name_to_key[name] = c["key"]
+
+    missing = [n for n in COLLECTION_NAMES if n not in name_to_key]
+    if not missing:
+        return name_to_key
+
+    # Create at the root level of the library/group.
+    payload = [{"name": n} for n in missing]
+    try:
+        zot.create_collections(payload)
+    except Exception as exc:
+        raise ValueError(
+            f"Couldn't auto-create missing Zotero sub-collections "
+            f"({', '.join(missing)}): {exc}. Check that the API key has "
+            f"write access to this library."
+        ) from exc
+
+    # Refetch to pick up the freshly-created keys
+    for c in zot.collections():
+        name = c.get("data", {}).get("name", "")
+        if name in COLLECTION_NAMES and name not in name_to_key:
+            name_to_key[name] = c["key"]
+
+    still_missing = [n for n in COLLECTION_NAMES if n not in name_to_key]
+    if still_missing:
+        raise ValueError(
+            f"Created collections but Zotero did not return keys for: "
+            f"{', '.join(still_missing)}"
+        )
+    return name_to_key
+
+
 def sync_papers(conn: sqlite3.Connection) -> tuple[int, int]:
     """Sync Zotero library to local DB. Returns (added_or_updated, skipped).
 
@@ -182,26 +222,14 @@ def push_to_zotero(conn: sqlite3.Connection) -> tuple[int, int]:
 
     For each paper, ensures it's in the Zotero sub-collection matching its
     local priority_level, and removes it from other priority sub-collections.
-    Items already in the correct state are not touched.
+    Items already in the correct state are not touched. Missing priority
+    sub-collections are auto-created in Zotero.
 
-    Returns (pushed, failed). Raises ValueError if expected sub-collections
-    don't exist in Zotero.
+    Returns (pushed, failed). Raises ValueError if auto-creation fails
+    (typically a write-permission issue with the API key).
     """
     zot = _get_client()
-
-    name_to_key: dict[str, str] = {}
-    for c in zot.collections():
-        name = c.get("data", {}).get("name", "")
-        if name in COLLECTION_NAMES:
-            name_to_key[name] = c["key"]
-
-    missing = [n for n in COLLECTION_NAMES if n not in name_to_key]
-    if missing:
-        raise ValueError(
-            f"Missing sub-collections in Zotero group: {', '.join(missing)}. "
-            "Create them in Zotero, then retry."
-        )
-
+    name_to_key = _ensure_priority_collections(zot)
     priority_to_key = {COLLECTION_NAMES[name]: key for name, key in name_to_key.items()}
     our_keys = set(name_to_key.values())
 
