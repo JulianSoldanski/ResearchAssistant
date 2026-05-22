@@ -8,6 +8,7 @@ SIDEBAR_WIDTH = 260
 NAV_ITEMS = [
     ("Kanban Board", "kanban", ft.Icons.VIEW_KANBAN),
     ("Cross-Paper Search", "search", ft.Icons.SEARCH),
+    ("Chapter Writer", "chapters", ft.Icons.EDIT_NOTE),
     ("Thesis", "thesis", ft.Icons.DESCRIPTION),
     ("Settings", "settings", ft.Icons.SETTINGS),
 ]

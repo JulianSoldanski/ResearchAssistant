@@ -72,7 +72,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                         [
                             ft.Checkbox(
                                 value=(pid not in deselected_paper_ids),
-                                on_change=lambda e, x=pid: _on_paper_toggle(x, e.control.value),
+                                on_change=lambda e, x=pid: _on_paper_toggle(x, str(e.data).lower() == "true"),
                             ),
                             ft.Text(
                                 title + ("" if has_pdf else "  (no PDF)"),
@@ -101,7 +101,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         ft.Checkbox(
             label=label,
             value=True,
-            on_change=lambda e, lv=level: _on_lane_toggle(lv, e.control.value),
+            on_change=lambda e, lv=level: _on_lane_toggle(lv, str(e.data).lower() == "true"),
         )
         for level, label in LANE_DEFS
     ]
@@ -156,6 +156,92 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             spacing=2, tight=True,
         )
 
+        # Agent-pipeline section (only if this search was run multi-agent)
+        agent_section_controls: list[ft.Control] = []
+        agent_workers_raw = None
+        try:
+            agent_workers_raw = row["agent_workers"]
+        except (IndexError, KeyError):
+            agent_workers_raw = None
+        agent_draft_raw = None
+        try:
+            agent_draft_raw = row["agent_draft"]
+        except (IndexError, KeyError):
+            agent_draft_raw = None
+
+        if agent_workers_raw:
+            try:
+                workers_list = json.loads(agent_workers_raw)
+            except (json.JSONDecodeError, TypeError):
+                workers_list = []
+
+            worker_tiles = []
+            for w in workers_list:
+                w_idx = w.get("batch_index", "?")
+                w_paper_idxs = w.get("paper_indices", [])
+                # Map global paper indices (1-based) to titles
+                w_titles = []
+                for global_idx in w_paper_idxs:
+                    # global_idx is 1-based position in this search's paper_id_list
+                    if 1 <= global_idx <= len(paper_id_list):
+                        pid = paper_id_list[global_idx - 1]
+                        p = db.get_paper_by_id(conn, pid)
+                        w_titles.append(
+                            f"[{global_idx}] {p['title']}" if p
+                            else f"[{global_idx}] (deleted #{pid})"
+                        )
+
+                worker_tiles.append(
+                    ft.Container(
+                        bgcolor=ft.Colors.BLUE_GREY_800,
+                        border_radius=4,
+                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                        content=ft.Column(
+                            [
+                                ft.Text(f"Worker {w_idx}", size=11,
+                                        color=ft.Colors.WHITE,
+                                        weight=ft.FontWeight.W_600),
+                                ft.Column(
+                                    [ft.Text(t, size=10,
+                                             color=ft.Colors.BLUE_GREY_300,
+                                             max_lines=1,
+                                             overflow=ft.TextOverflow.ELLIPSIS)
+                                     for t in w_titles],
+                                    spacing=1, tight=True,
+                                ),
+                                ft.Container(height=4),
+                                ft.Markdown(
+                                    value=w.get("output", ""),
+                                    selectable=True,
+                                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                                ),
+                            ],
+                            spacing=2, tight=True,
+                        ),
+                    )
+                )
+
+            agent_section_controls = [
+                ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
+                ft.Text(f"Agent pipeline ({len(workers_list)} workers)", size=10,
+                        color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
+                *worker_tiles,
+            ]
+            if agent_draft_raw:
+                agent_section_controls += [
+                    ft.Text("Synthesizer draft (pre-critic)", size=10,
+                            color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
+                    ft.Container(
+                        bgcolor=ft.Colors.BLUE_GREY_800,
+                        border_radius=4,
+                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                        content=ft.Markdown(
+                            value=agent_draft_raw, selectable=True,
+                            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                        ),
+                    ),
+                ]
+
         body = ft.Container(
             padding=ft.Padding(left=10, right=10, top=0, bottom=10),
             visible=expand_by_default,
@@ -180,6 +266,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                         value=response, selectable=True,
                         extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
                     ),
+                    *agent_section_controls,
                 ],
                 spacing=6, tight=True,
             ),
@@ -264,6 +351,21 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         width=180,
     )
 
+    # Critic only meaningful when multi-agent is on. Default critic ON.
+    critic_checkbox = ft.Checkbox(label="Critic pass", value=True, disabled=True)
+
+    def _on_multi_toggle(e):
+        critic_checkbox.disabled = not (str(e.data).lower() == "true")
+        page.update()
+
+    multi_agent_checkbox = ft.Checkbox(
+        label="Multi-agent mode",
+        value=False,
+        tooltip="Split papers into batches of 5, parallel workers + synthesizer (+ optional critic). "
+                "Slower and uses more tokens, but better for large corpora.",
+        on_change=_on_multi_toggle,
+    )
+
     # --- Actions ---
     def _set_busy(busy: bool, label: str = ""):
         busy_ring.visible = busy
@@ -313,18 +415,63 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             page.update()
             return
 
-        _set_busy(True, f"Searching across {len(paper_ids)} papers…")
         raw_query_value = (query_input.value or "").strip()
         selected_model = model_dropdown.value or _gc.DEFAULT_MODEL
+        use_multi_agent = bool(multi_agent_checkbox.value)
+        use_critic = bool(critic_checkbox.value)
+
+        # Diagnostic: print what's actually being dispatched. Remove once verified.
+        print(
+            f"[cross_search] dispatch: multi_agent={use_multi_agent} "
+            f"len(paper_ids)={len(paper_ids)} "
+            f"selected_lanes={sorted(selected_lanes)} "
+            f"deselected_count={len(deselected_paper_ids)} "
+            f"paper_ids={paper_ids}",
+            flush=True,
+        )
+
+        kickoff = (
+            f"Dispatching multi-agent search across {len(paper_ids)} papers…"
+            if use_multi_agent else
+            f"Searching across {len(paper_ids)} papers…"
+        )
+        _set_busy(True, kickoff)
+
+        def _on_progress(msg: str):
+            # Called from worker thread (or pipeline thread). Safe to mutate
+            # the control + call page.update — Flet 0.85 tolerates this.
+            info_text.value = msg
+            info_text.color = ft.Colors.BLUE_GREY_400
+            page.update()
 
         def run():
             try:
                 from api import gemini_client
                 thesis_context = db.get_thesis_context(conn)
                 result = gemini_client.cross_paper_search(
-                    paper_ids, conn, prompt, thesis_context, selected_model
+                    paper_ids, conn, prompt, thesis_context, selected_model,
+                    multi_agent=use_multi_agent,
+                    enable_critic=use_critic,
+                    on_progress=_on_progress,
                 )
-                sid = db.save_search(conn, raw_query_value, prompt, paper_ids, result)
+                # `result` is a PipelineResult — `.final` is the answer to save
+                workers_json = None
+                draft_text = None
+                if result.workers:
+                    workers_json = json.dumps([
+                        {
+                            "batch_index": w.batch_index,
+                            "paper_indices": w.paper_indices,
+                            "output": w.output,
+                        }
+                        for w in result.workers
+                    ])
+                    draft_text = result.synthesizer_draft
+                sid = db.save_search(
+                    conn, raw_query_value, prompt, paper_ids, result.final,
+                    agent_workers=workers_json,
+                    agent_draft=draft_text,
+                )
                 _refresh_searches(highlight_id=sid)
                 info_text.value = f"✓ Done. {len(paper_ids)} papers searched."
                 info_text.color = ft.Colors.GREEN_300
@@ -389,7 +536,9 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                 ft.Row([generate_btn, busy_ring, info_text],
                        spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 optimized_input,
-                ft.Row([search_btn, model_dropdown], spacing=8,
+                ft.Row([search_btn, model_dropdown,
+                        multi_agent_checkbox, critic_checkbox],
+                       spacing=8,
                        vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ft.Divider(height=1, color=ft.Colors.BLUE_GREY_700),
                 ft.Text("Saved Searches", size=11, color=ft.Colors.BLUE_GREY_400,

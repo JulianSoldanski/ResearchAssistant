@@ -8,6 +8,8 @@ DB_PATH = Path(__file__).parent.parent / "research_assistant.db"
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Required for ON DELETE CASCADE (e.g. thesis_chapters subchapter cleanup)
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -55,15 +57,46 @@ def init_db(conn: sqlite3.Connection) -> None:
             optimized_query TEXT NOT NULL,
             paper_ids       TEXT NOT NULL,   -- JSON array of paper IDs
             response        TEXT NOT NULL,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT (datetime('now')),
+            agent_workers   TEXT,            -- JSON list[WorkerOut] (NULL = single-shot)
+            agent_draft     TEXT             -- synthesizer pre-critic draft
+        );
+
+        CREATE TABLE IF NOT EXISTS chapters (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            title         TEXT NOT NULL,
+            instructions  TEXT,
+            paper_ids     TEXT NOT NULL,    -- JSON array of paper IDs
+            content       TEXT NOT NULL,
+            model_used    TEXT,
+            created_at    TEXT DEFAULT (datetime('now')),
+            agent_workers TEXT,             -- JSON list[WorkerOut] (NULL = single-shot)
+            agent_draft   TEXT              -- synthesizer pre-critic draft
+        );
+
+        CREATE TABLE IF NOT EXISTS thesis_chapters (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_id   INTEGER REFERENCES thesis_chapters(id) ON DELETE CASCADE,
+            title       TEXT NOT NULL,
+            content     TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT DEFAULT (datetime('now')),
+            updated_at  TEXT DEFAULT (datetime('now'))
         );
     """)
-    # Migrate existing databases that predate the notes column
-    try:
-        conn.execute("ALTER TABLE papers ADD COLUMN notes TEXT")
-        conn.commit()
-    except Exception:
-        pass
+    # Idempotent migrations for older databases. Each ALTER is wrapped in
+    # try/except so re-running on a current schema is a no-op.
+    for stmt in (
+        "ALTER TABLE papers ADD COLUMN notes TEXT",
+        "ALTER TABLE searches ADD COLUMN agent_workers TEXT",
+        "ALTER TABLE searches ADD COLUMN agent_draft TEXT",
+        "ALTER TABLE chapters ADD COLUMN agent_workers TEXT",
+        "ALTER TABLE chapters ADD COLUMN agent_draft TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
     conn.commit()
 
 
@@ -100,13 +133,18 @@ def set_paper_pdf_path(conn: sqlite3.Connection, paper_id: int, pdf_path: str) -
 
 
 def reset_database(conn: sqlite3.Connection) -> None:
-    """Clear all papers, comments, AI cache, and saved searches. Settings preserved."""
+    """Clear papers, comments, AI cache, saved searches, and chapter drafts.
+    Settings (thesis description, writing style) preserved. The user's thesis
+    chapter structure is also preserved.
+    """
     conn.executescript("""
         DELETE FROM comments;
         DELETE FROM searches;
+        DELETE FROM chapters;
         DELETE FROM ai_cache;
         DELETE FROM papers;
-        DELETE FROM sqlite_sequence WHERE name IN ('papers', 'comments', 'ai_cache', 'searches');
+        DELETE FROM sqlite_sequence
+            WHERE name IN ('papers', 'comments', 'ai_cache', 'searches', 'chapters');
     """)
     conn.commit()
 
@@ -164,11 +202,15 @@ def delete_comment(conn: sqlite3.Connection, comment_id: int) -> None:
 # --- Searches (cross-paper search history) ---
 
 def save_search(conn: sqlite3.Connection, raw_query: str, optimized_query: str,
-                paper_ids: list[int], response: str) -> int:
+                paper_ids: list[int], response: str,
+                agent_workers: str | None = None,
+                agent_draft: str | None = None) -> int:
     cur = conn.execute("""
-        INSERT INTO searches (raw_query, optimized_query, paper_ids, response)
-        VALUES (?, ?, ?, ?)
-    """, (raw_query, optimized_query, json.dumps(paper_ids), response))
+        INSERT INTO searches (raw_query, optimized_query, paper_ids, response,
+                              agent_workers, agent_draft)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (raw_query, optimized_query, json.dumps(paper_ids), response,
+          agent_workers, agent_draft))
     conn.commit()
     return cur.lastrowid
 
@@ -182,6 +224,94 @@ def get_all_searches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def delete_search(conn: sqlite3.Connection, search_id: int) -> None:
     conn.execute("DELETE FROM searches WHERE id = ?", (search_id,))
     conn.commit()
+
+
+# --- Chapters (saved AI-drafted thesis chapters) ---
+
+def save_chapter(conn: sqlite3.Connection, title: str, instructions: str,
+                 paper_ids: list[int], content: str, model_used: str,
+                 agent_workers: str | None = None,
+                 agent_draft: str | None = None) -> int:
+    cur = conn.execute("""
+        INSERT INTO chapters (title, instructions, paper_ids, content,
+                              model_used, agent_workers, agent_draft)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (title, instructions, json.dumps(paper_ids), content, model_used,
+          agent_workers, agent_draft))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_all_chapters(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM chapters ORDER BY created_at DESC"
+    ).fetchall()
+
+
+def delete_chapter(conn: sqlite3.Connection, chapter_id: int) -> None:
+    conn.execute("DELETE FROM chapters WHERE id = ?", (chapter_id,))
+    conn.commit()
+
+
+# --- Thesis chapter tree (user-defined outline + content) ---
+
+def get_thesis_chapters(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All thesis chapter rows, sorted by (parent_id NULLS FIRST, sort_order)."""
+    return conn.execute(
+        "SELECT * FROM thesis_chapters "
+        "ORDER BY (parent_id IS NOT NULL), parent_id, sort_order, id"
+    ).fetchall()
+
+
+def add_thesis_chapter(conn: sqlite3.Connection, parent_id: int | None,
+                       title: str = "Untitled") -> int:
+    # New chapter goes at the end of its siblings.
+    row = conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next "
+        "FROM thesis_chapters WHERE parent_id IS ?",
+        (parent_id,)
+    ).fetchone()
+    sort_order = row["next"] if row else 0
+    cur = conn.execute(
+        "INSERT INTO thesis_chapters (parent_id, title, sort_order) "
+        "VALUES (?, ?, ?)",
+        (parent_id, title, sort_order)
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_thesis_chapter_title(conn: sqlite3.Connection, chapter_id: int,
+                                title: str) -> None:
+    conn.execute(
+        "UPDATE thesis_chapters SET title = ?, updated_at = datetime('now') "
+        "WHERE id = ?",
+        (title, chapter_id)
+    )
+    conn.commit()
+
+
+def update_thesis_chapter_content(conn: sqlite3.Connection, chapter_id: int,
+                                  content: str) -> None:
+    conn.execute(
+        "UPDATE thesis_chapters SET content = ?, updated_at = datetime('now') "
+        "WHERE id = ?",
+        (content, chapter_id)
+    )
+    conn.commit()
+
+
+def delete_thesis_chapter(conn: sqlite3.Connection, chapter_id: int) -> None:
+    """Delete a chapter (children cascade via FK)."""
+    conn.execute("DELETE FROM thesis_chapters WHERE id = ?", (chapter_id,))
+    conn.commit()
+
+
+def get_thesis_chapter_by_id(conn: sqlite3.Connection,
+                             chapter_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM thesis_chapters WHERE id = ?", (chapter_id,)
+    ).fetchone()
 
 
 # --- AI Cache ---
@@ -254,14 +384,14 @@ def get_thesis_context(conn: sqlite3.Connection) -> str:
         if val:
             parts.append(f"## {label}\n{val}")
 
-    style = get_setting(conn, "writing_style", "").strip()
-    if style:
+    profile = get_setting(conn, "writing_style_analysis", "").strip()
+    if profile:
         parts.append(
-            "## Writing Style\n"
-            "Match the tone, vocabulary, and sentence structure of the "
-            "following sample(s) in your response. Do NOT echo the sample "
-            "back — only imitate the style.\n\n"
-            f"```\n{style}\n```"
+            "## Writing Style Guide\n"
+            "Write your response so it matches the following style profile "
+            "(this describes the user's writing — apply the patterns "
+            "naturally; do NOT mention the profile or quote from it):\n\n"
+            f"{profile}"
         )
 
     return "\n\n".join(parts)

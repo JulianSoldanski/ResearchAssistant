@@ -1,6 +1,6 @@
 import flet as ft
 from db import database as db
-from ui import sidebar, kanban, cross_search, thesis, settings
+from ui import sidebar, kanban, cross_search, thesis, settings, chapters
 
 
 def main(page: ft.Page):
@@ -32,6 +32,8 @@ def main(page: ft.Page):
             main_content.content = kanban.build(conn, page)
         elif view_key == "search":
             main_content.content = cross_search.build(conn, page)
+        elif view_key == "chapters":
+            main_content.content = chapters.build(conn, page)
         elif view_key == "thesis":
             main_content.content = thesis.build(conn, page)
         elif view_key == "settings":
