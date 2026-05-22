@@ -648,33 +648,53 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         papers = db.get_papers_by_priority(conn, level)
         cards = [_paper_card(p) for p in papers]
 
+        # Body uses ListView (built-in scroll) rather than Column scroll=AUTO,
+        # which is unreliable in deeply nested expand chains on Flet 0.85.
+        # Body is NOT wrapped in a DragTarget — the header below is.
         body = ft.Container(
             bgcolor=ft.Colors.BLUE_GREY_800,
             border_radius=ft.BorderRadius(top_left=0, top_right=0,
                                           bottom_left=8, bottom_right=8),
             padding=ft.Padding(left=8, right=8, top=8, bottom=8),
             expand=True,
-            content=ft.Column(
-                cards if cards else [
-                    ft.Text("Drop papers here", size=11,
+            content=ft.ListView(
+                controls=cards if cards else [
+                    ft.Text("Drop on the header to move here", size=11,
                             color=ft.Colors.BLUE_GREY_500, italic=True)
                 ],
-                scroll=ft.ScrollMode.AUTO,
-                spacing=0,
                 expand=True,
+                spacing=0,
+                auto_scroll=False,
             ),
         )
 
+        # The colored header IS the drop zone. Drag a card up to a column
+        # header to move it. This trades a slightly worse drop target (smaller
+        # area) for fully working scroll in the body.
+        header_inner = ft.Container(
+            bgcolor=color,
+            border_radius=ft.BorderRadius(top_left=8, top_right=8,
+                                          bottom_left=0, bottom_right=0),
+            padding=ft.Padding(left=10, right=10, top=10, bottom=10),
+            content=ft.Row([
+                ft.Icon(icon, size=16, color=ft.Colors.WHITE),
+                ft.Text(label, size=13, weight=ft.FontWeight.BOLD,
+                        color=ft.Colors.WHITE),
+                ft.Text(f"({len(papers)})", size=11, color=ft.Colors.WHITE70),
+            ], spacing=6),
+        )
+
         def _on_will_accept(e):
-            body.bgcolor = ft.Colors.BLUE_GREY_700
+            # Lighten the header to signal "drop here"
+            header_inner.opacity = 0.7
             page.update()
 
         def _on_leave(e):
-            body.bgcolor = ft.Colors.BLUE_GREY_800
+            header_inner.opacity = 1.0
             page.update()
 
         def _on_accept(e):
-            body.bgcolor = ft.Colors.BLUE_GREY_800
+            header_inner.opacity = 1.0
             src = page.get_control(e.src_id)
             if src is not None and getattr(src, "data", None):
                 try:
@@ -687,33 +707,18 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                     db.set_priority(conn, pid, level)
             refresh()
 
-        drop_target = ft.DragTarget(
+        header_drop = ft.DragTarget(
             group="paper",
-            content=body,
+            content=header_inner,
             on_will_accept=_on_will_accept,
             on_leave=_on_leave,
             on_accept=_on_accept,
-            expand=True,
         )
 
         return ft.Container(
             expand=True,
             content=ft.Column(
-                [
-                    ft.Container(
-                        bgcolor=color,
-                        border_radius=ft.BorderRadius(top_left=8, top_right=8,
-                                                      bottom_left=0, bottom_right=0),
-                        padding=ft.Padding(left=10, right=10, top=6, bottom=6),
-                        content=ft.Row([
-                            ft.Icon(icon, size=16, color=ft.Colors.WHITE),
-                            ft.Text(label, size=13, weight=ft.FontWeight.BOLD,
-                                    color=ft.Colors.WHITE),
-                            ft.Text(f"({len(papers)})", size=11, color=ft.Colors.WHITE70),
-                        ], spacing=6),
-                    ),
-                    drop_target,
-                ],
+                [header_drop, body],
                 spacing=0,
                 expand=True,
             ),
@@ -728,7 +733,9 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         controls=_build_columns(),
         spacing=12,
         expand=True,
-        vertical_alignment=ft.CrossAxisAlignment.START,
+        # STRETCH gives each column a bounded height so the inner Column with
+        # scroll=AUTO can actually scroll when content overflows.
+        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
     return ft.Container(
