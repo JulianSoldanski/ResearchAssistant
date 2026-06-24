@@ -226,17 +226,15 @@ def run_pipeline(
     progress(f"Dispatching {n_workers} workers…")
 
     # --- Map: run workers in parallel ---
-    client = _gc._get_client()
     workers: list[WorkerOut] = [None] * n_workers  # preserve order
     completed = 0
 
     def run_worker(batch_idx: int, blocks: list) -> WorkerOut:
         prompt = _worker_prompt(batch_idx, n_workers, task_kind, task_prompt, blocks)
-        resp = _gc._generate_with_retry(client, wm, prompt)
         return WorkerOut(
             batch_index=batch_idx,
             paper_indices=[i for i, _, _ in blocks],
-            output=(resp.text or "").strip(),
+            output=_gc._call_model(wm, prompt).strip(),
         )
 
     with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_WORKERS) as ex:
@@ -253,8 +251,7 @@ def run_pipeline(
     # --- Reduce: synthesize ---
     progress("Synthesizing…")
     syn_prompt = _synthesizer_prompt(task_kind, task_prompt, thesis_context, workers)
-    syn_resp = _gc._generate_with_retry(client, sm, syn_prompt)
-    draft = (syn_resp.text or "").strip()
+    draft = _gc._call_model(sm, syn_prompt).strip()
 
     if not enable_critic:
         return PipelineResult(final=draft, workers=workers, synthesizer_draft=draft,
@@ -263,8 +260,7 @@ def run_pipeline(
     # --- Refine: critic ---
     progress("Critic reviewing…")
     crit_prompt = _critic_prompt(task_kind, task_prompt, draft, workers)
-    crit_resp = _gc._generate_with_retry(client, cm, crit_prompt)
-    revision = (crit_resp.text or "").strip()
+    revision = _gc._call_model(cm, crit_prompt).strip()
 
     progress("Done.")
     return PipelineResult(final=revision, workers=workers,

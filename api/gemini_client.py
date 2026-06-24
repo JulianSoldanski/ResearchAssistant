@@ -17,6 +17,10 @@ _RETRY_TOKENS = ("503", "429", "500", "502", "504",
 _RETRY_DELAYS = (8, 20, 45)  # seconds; total backoff up to ~73s
 
 
+def _is_openai_model(model: str) -> bool:
+    return model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3")
+
+
 def _generate_with_retry(client, model: str, contents: str):
     """Call Gemini with auto-retry on transient errors (503/429/etc)."""
     last_exc = None
@@ -37,6 +41,32 @@ def _generate_with_retry(client, model: str, contents: str):
             time.sleep(_RETRY_DELAYS[attempt])
     raise last_exc
 
+
+def _call_openai(model: str, prompt: str) -> str:
+    """Call OpenAI API and return response text."""
+    from openai import OpenAI
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set in .env")
+        _openai_client = OpenAI(api_key=api_key)
+    response = _openai_client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content or ""
+
+
+def _call_model(model: str, prompt: str) -> str:
+    """Provider-agnostic generation: routes to OpenAI or Gemini based on model id."""
+    if _is_openai_model(model):
+        return _call_openai(model, prompt)
+    client = _get_client()
+    response = _generate_with_retry(client, model, prompt)
+    return response.text or ""
+
+
 # (display label, model id). Order = order in the UI dropdown; first entry is default.
 AVAILABLE_MODELS: list[tuple[str, str]] = [
     ("Flash (fast)", "gemini-3-flash-preview"),
@@ -44,8 +74,17 @@ AVAILABLE_MODELS: list[tuple[str, str]] = [
 ]
 DEFAULT_MODEL = AVAILABLE_MODELS[0][1]
 
+# Models available in the cross-paper search dropdown (includes OpenAI).
+SEARCH_MODELS: list[tuple[str, str]] = [
+    ("GPT-5.5", "gpt-5.5-2026-04-23"),
+    ("Flash (fast)", "gemini-3-flash-preview"),
+    ("Pro (deeper)", "gemini-3.1-pro-preview"),
+]
+DEFAULT_SEARCH_MODEL = SEARCH_MODELS[0][1]
+
 
 _client: genai.Client | None = None
+_openai_client = None
 
 
 def _get_client() -> genai.Client:
@@ -225,7 +264,7 @@ def analyze_writing_style(sample: str) -> str:
     return (response.text or "").strip()
 
 
-def optimize_search_query(raw_query: str) -> str:
+def optimize_search_query(raw_query: str, model: str = SEARCH_MODEL) -> str:
     """Rewrite a rough user query into a precise prompt for an LLM cross-paper search."""
     meta_prompt = (
         "You are a search-query expert. Transform the user's rough query into a "
@@ -242,14 +281,12 @@ def optimize_search_query(raw_query: str) -> str:
         "Output ONLY the optimized prompt as a single block of plain text. "
         "Do not include explanations, examples, or markdown headings."
     )
-    client = _get_client()
-    response = _generate_with_retry(client, SEARCH_MODEL, meta_prompt)
-    return (response.text or "").strip()
+    return _call_model(model, meta_prompt).strip()
 
 
 def cross_paper_search(paper_ids: list[int], conn: sqlite3.Connection,
                        optimized_query: str, thesis_context: str = "",
-                       model: str = SEARCH_MODEL,
+                       model: str = DEFAULT_SEARCH_MODEL,
                        multi_agent: bool = False,
                        enable_critic: bool = True,
                        on_progress=None) -> "PipelineResult":
@@ -319,6 +356,4 @@ def cross_paper_search(paper_ids: list[int], conn: sqlite3.Connection,
         + f"\n\n---\n\nUser query: {optimized_query}"
     )
 
-    client = _get_client()
-    response = _generate_with_retry(client, model, full_prompt)
-    return PipelineResult.single_shot(response.text or "")
+    return PipelineResult.single_shot(_call_model(model, full_prompt))

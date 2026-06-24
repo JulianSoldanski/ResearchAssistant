@@ -403,8 +403,8 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
     model_dropdown = ft.Dropdown(
         label="Model",
         options=[ft.DropdownOption(key=mid, text=label)
-                 for label, mid in _gc.AVAILABLE_MODELS],
-        value=_gc.DEFAULT_MODEL,
+                 for label, mid in _gc.SEARCH_MODELS],
+        value=_gc.DEFAULT_SEARCH_MODEL,
         text_size=13,
         width=180,
     )
@@ -444,10 +444,14 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
 
         _set_busy(True, "Optimizing query…")
 
+        selected_model_for_gen = model_dropdown.value or _gc.DEFAULT_SEARCH_MODEL
+
         def run():
             try:
                 from api import gemini_client
-                optimized_input.value = gemini_client.optimize_search_query(raw)
+                optimized_input.value = gemini_client.optimize_search_query(
+                    raw, model=selected_model_for_gen
+                )
                 info_text.value = "✓ Optimized prompt ready. Review and click Run Search."
                 info_text.color = ft.Colors.GREEN_300
             except Exception as exc:
@@ -474,7 +478,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             return
 
         raw_query_value = (query_input.value or "").strip()
-        selected_model = model_dropdown.value or _gc.DEFAULT_MODEL
+        selected_model = model_dropdown.value or _gc.DEFAULT_SEARCH_MODEL
         use_multi_agent = bool(multi_agent_checkbox.value)
         use_critic = bool(critic_checkbox.value)
 
