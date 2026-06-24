@@ -1,10 +1,22 @@
 import os
+import re
 import sqlite3
+from html import escape
 from pathlib import Path
 from dotenv import load_dotenv
 from pyzotero import zotero
 
 from db import database as db
+
+
+# Tag we put on Zotero child notes we manage. Used to find our note among any
+# other notes the user may have attached to a paper.
+MANAGED_NOTE_TAG = "research-assistant"
+
+# Section markers inside the managed note. <h1> headings make the note read
+# nicely inside Zotero's editor and give us stable anchors to parse against.
+_WHY_HEADING = "Why is this important"
+_NOTES_HEADING = "Notes"
 
 load_dotenv()
 
@@ -122,6 +134,109 @@ def _resolve_pdf_path(zot: zotero.Zotero, parent_key: str) -> str | None:
     return None
 
 
+def _build_note_html(why: str, notes_text: str) -> str:
+    """Render the two-section managed note as Zotero-flavored HTML."""
+    why_html = escape(why or "").replace("\n", "<br>")
+    notes_html = escape(notes_text or "").replace("\n", "<br>")
+    return (
+        f"<h1>{_WHY_HEADING}</h1>"
+        f"<p>{why_html}</p>"
+        f"<h1>{_NOTES_HEADING}</h1>"
+        f"<p>{notes_html}</p>"
+    )
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _strip_html(fragment: str) -> str:
+    """Best-effort HTML → plain-text converter for the small subset Zotero emits."""
+    fragment = _BR_RE.sub("\n", fragment)
+    fragment = re.sub(r"</p\s*>", "\n", fragment, flags=re.IGNORECASE)
+    fragment = _TAG_RE.sub("", fragment)
+    fragment = fragment.replace("&nbsp;", " ")
+    fragment = fragment.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return fragment.strip("\n")
+
+
+def _parse_note_html(html: str) -> tuple[str, str]:
+    """Pull the (why, notes) sections out of a managed note's HTML.
+
+    Robust to either heading appearing first, missing sections, and the user
+    editing the body in Zotero's WYSIWYG (which may swap `<h1>` for other
+    tags). Falls back to dumping the whole stripped text into `notes` when no
+    heading is recognized.
+    """
+    if not html:
+        return "", ""
+    # Split on any heading tag whose text matches one of our markers
+    pattern = re.compile(
+        r"<h[1-6][^>]*>\s*(" + re.escape(_WHY_HEADING) + r"|"
+        + re.escape(_NOTES_HEADING) + r")\s*</h[1-6]>",
+        re.IGNORECASE,
+    )
+    parts = pattern.split(html)
+    # parts: [pre, marker1, body1, marker2, body2, ...]
+    sections: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        marker = parts[i].strip()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        sections[marker] = _strip_html(body).strip()
+    if not sections:
+        return "", _strip_html(html).strip()
+    return sections.get(_WHY_HEADING, ""), sections.get(_NOTES_HEADING, "")
+
+
+def _find_managed_note(zot: zotero.Zotero, parent_key: str) -> dict | None:
+    """Return the managed child note for a paper, or None."""
+    try:
+        children = zot.children(parent_key)
+    except Exception:
+        return None
+    for child in children:
+        data = child.get("data", {})
+        if data.get("itemType") != "note":
+            continue
+        tags = [t.get("tag", "") for t in data.get("tags", []) or []]
+        if MANAGED_NOTE_TAG in tags:
+            return child
+    return None
+
+
+def _upsert_managed_note(zot: zotero.Zotero, parent_key: str,
+                         why: str, notes_text: str) -> bool:
+    """Create or update the managed child note for a paper.
+
+    Returns True on success (including no-op), False on API failure.
+    Skips entirely when both fields are empty AND no note exists yet.
+    """
+    new_html = _build_note_html(why, notes_text)
+    existing = _find_managed_note(zot, parent_key)
+
+    if existing is None:
+        if not (why or "").strip() and not (notes_text or "").strip():
+            return True  # nothing to push, nothing to create
+        template = zot.item_template("note")
+        template["note"] = new_html
+        template["tags"] = [{"tag": MANAGED_NOTE_TAG}]
+        template["parentItem"] = parent_key
+        try:
+            zot.create_items([template])
+            return True
+        except Exception:
+            return False
+
+    if existing["data"].get("note", "") == new_html:
+        return True  # already in sync
+    existing["data"]["note"] = new_html
+    try:
+        zot.update_item(existing)
+        return True
+    except Exception:
+        return False
+
+
 def _build_priority_collection_map(zot: zotero.Zotero) -> dict[str, int]:
     """Returns {collection_key: priority_level} for our 5 named sub-collections."""
     mapping: dict[str, int] = {}
@@ -211,8 +326,35 @@ def sync_papers(conn: sqlite3.Connection) -> tuple[int, int]:
 
         local_path = _resolve_pdf_path(zot, zotero_id)
 
+        existed_before = conn.execute(
+            "SELECT id, notes, notes_text FROM papers WHERE zotero_id = ?",
+            (zotero_id,),
+        ).fetchone()
+
         db.upsert_paper(conn, zotero_id, title, authors, year, local_path, priority)
         updated += 1
+
+        # Pull the managed note from Zotero only when local notes are empty —
+        # "local wins" means we never overwrite something the user typed here.
+        local_why = (existed_before["notes"] if existed_before else "") or ""
+        local_notes = (existed_before["notes_text"] if existed_before else "") or ""
+        if not local_why.strip() and not local_notes.strip():
+            note = _find_managed_note(zot, zotero_id)
+            if note is not None:
+                remote_why, remote_notes = _parse_note_html(
+                    note["data"].get("note", "")
+                )
+                if remote_why or remote_notes:
+                    paper_row = conn.execute(
+                        "SELECT id FROM papers WHERE zotero_id = ?",
+                        (zotero_id,),
+                    ).fetchone()
+                    if paper_row is not None:
+                        pid = paper_row["id"]
+                        if remote_why:
+                            db.update_paper_notes(conn, pid, remote_why)
+                        if remote_notes:
+                            db.update_paper_notes_text(conn, pid, remote_notes)
 
     return updated, skipped
 
@@ -233,7 +375,9 @@ def push_to_zotero(conn: sqlite3.Connection) -> tuple[int, int]:
     priority_to_key = {COLLECTION_NAMES[name]: key for name, key in name_to_key.items()}
     our_keys = set(name_to_key.values())
 
-    papers = conn.execute("SELECT zotero_id, priority_level FROM papers").fetchall()
+    papers = conn.execute(
+        "SELECT zotero_id, priority_level, notes, notes_text FROM papers"
+    ).fetchall()
     pushed = 0
     failed = 0
 
@@ -255,14 +399,22 @@ def push_to_zotero(conn: sqlite3.Connection) -> tuple[int, int]:
         new_collections = [c for c in current if c not in our_keys]
         new_collections.append(target_key)
 
-        if set(new_collections) == set(current):
-            continue
+        collections_changed = set(new_collections) != set(current)
+        if collections_changed:
+            item["data"]["collections"] = new_collections
+            try:
+                zot.update_item(item)
+                pushed += 1
+            except Exception:
+                failed += 1
+                continue  # don't try to push the note if the item update failed
 
-        item["data"]["collections"] = new_collections
-        try:
-            zot.update_item(item)
-            pushed += 1
-        except Exception:
+        # Push the managed note (local wins, so we always overwrite Zotero)
+        ok = _upsert_managed_note(
+            zot, zotero_id,
+            paper["notes"] or "", paper["notes_text"] or "",
+        )
+        if not ok:
             failed += 1
 
     return pushed, failed

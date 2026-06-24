@@ -115,83 +115,99 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         open_paper_state["pid"] = pid
         open_paper_state["level"] = paper.get("priority_level")
 
-        notes_field = ft.TextField(
-            label="Why is this paper relevant?",
-            multiline=True,
-            min_lines=3,
-            max_lines=5,
-            value=paper.get("notes") or "",
-            text_size=13,
-            on_change=lambda e: db.update_paper_notes(conn, pid, e.control.value),
+        # Live state for the two note fields. The notes dialog mutates these
+        # via auto-save on each keystroke; the preview Texts below re-read them
+        # whenever the dialog closes.
+        notes_state = {
+            "why": paper.get("notes") or "",
+            "text": paper.get("notes_text") or "",
+        }
+
+        why_preview = ft.Text(
+            value=notes_state["why"] or "(empty)",
+            size=12,
+            color=ft.Colors.WHITE if notes_state["why"] else ft.Colors.BLUE_GREY_500,
+            italic=not bool(notes_state["why"]),
+            selectable=True,
+        )
+        text_preview = ft.Text(
+            value=(notes_state["text"][:240] + ("…" if len(notes_state["text"]) > 240 else ""))
+                  or "(empty)",
+            size=12,
+            color=ft.Colors.WHITE if notes_state["text"] else ft.Colors.BLUE_GREY_500,
+            italic=not bool(notes_state["text"]),
+            selectable=True,
         )
 
-        comments_column = ft.Column([], spacing=6, scroll=ft.ScrollMode.AUTO, expand=True)
-        comment_input = ft.TextField(
-            label="Add a comment",
-            hint_text="Write what you just found…",
-            multiline=True,
-            min_lines=2,
-            max_lines=3,
-            text_size=13,
-            expand=True,
-        )
-
-        def _refresh_comments():
-            comments_column.controls.clear()
-            rows = db.get_comments(conn, pid)
-            if not rows:
-                comments_column.controls.append(
-                    ft.Text("No comments yet. Add your first thought below.",
-                            size=11, italic=True, color=ft.Colors.BLUE_GREY_500)
-                )
-            else:
-                for c in rows:
-                    cid = c["id"]
-                    comments_column.controls.append(
-                        ft.Container(
-                            bgcolor=ft.Colors.BLUE_GREY_700,
-                            border_radius=6,
-                            padding=ft.Padding(left=10, right=8, top=8, bottom=6),
-                            content=ft.Column(
-                                [
-                                    ft.Text(c["comment_text"], size=12, selectable=True),
-                                    ft.Row(
-                                        [
-                                            ft.Text(c["created_at"], size=10,
-                                                    color=ft.Colors.BLUE_GREY_400, italic=True),
-                                            ft.IconButton(
-                                                icon=ft.Icons.DELETE_OUTLINE,
-                                                icon_size=14,
-                                                tooltip="Delete comment",
-                                                on_click=lambda _, x=cid: _delete_comment(x),
-                                            ),
-                                        ],
-                                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    ),
-                                ],
-                                spacing=2,
-                                tight=True,
-                            ),
-                        )
-                    )
+        def _refresh_note_previews():
+            why = notes_state["why"]
+            text = notes_state["text"]
+            why_preview.value = why or "(empty)"
+            why_preview.color = ft.Colors.WHITE if why else ft.Colors.BLUE_GREY_500
+            why_preview.italic = not bool(why)
+            preview_text = text[:240] + ("…" if len(text) > 240 else "")
+            text_preview.value = preview_text or "(empty)"
+            text_preview.color = ft.Colors.WHITE if text else ft.Colors.BLUE_GREY_500
+            text_preview.italic = not bool(text)
             page.update()
 
-        def _add_comment(_):
-            text = (comment_input.value or "").strip()
-            if not text:
-                return
-            db.add_comment(conn, pid, text)
-            comment_input.value = ""
-            _refresh_comments()
+        def _open_notes_dialog(_=None):
+            why_field = ft.TextField(
+                label="Why is this important?",
+                multiline=True,
+                min_lines=3,
+                max_lines=6,
+                value=notes_state["why"],
+                text_size=13,
+            )
+            text_field = ft.TextField(
+                label="Notes",
+                hint_text="All your notes about this paper. Synced to Zotero on Push.",
+                multiline=True,
+                min_lines=14,
+                max_lines=30,
+                value=notes_state["text"],
+                text_size=13,
+                expand=True,
+            )
 
-        def _delete_comment(cid: int):
-            db.delete_comment(conn, cid)
-            _refresh_comments()
+            def _on_why_change(e):
+                notes_state["why"] = e.control.value or ""
+                db.update_paper_notes(conn, pid, notes_state["why"])
 
-        add_comment_btn = ft.ElevatedButton(
-            content="Add Comment",
-            icon=ft.Icons.ADD_COMMENT,
-            on_click=_add_comment,
+            def _on_text_change(e):
+                notes_state["text"] = e.control.value or ""
+                db.update_paper_notes_text(conn, pid, notes_state["text"])
+
+            why_field.on_change = _on_why_change
+            text_field.on_change = _on_text_change
+
+            def _close_notes(_=None):
+                page.pop_dialog()
+                _refresh_note_previews()
+
+            notes_dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Notes — " + (paper.get("title") or "Untitled"),
+                              size=14, weight=ft.FontWeight.BOLD,
+                              max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                content=ft.Container(
+                    width=720,
+                    height=560,
+                    content=ft.Column(
+                        [why_field, text_field],
+                        spacing=12,
+                        expand=True,
+                    ),
+                ),
+                actions=[ft.TextButton(content="Done", on_click=_close_notes)],
+            )
+            page.show_dialog(notes_dialog)
+
+        open_notes_btn = ft.ElevatedButton(
+            content="Open Notes",
+            icon=ft.Icons.EDIT_NOTE,
+            on_click=_open_notes_dialog,
         )
 
         template_options = [
@@ -438,18 +454,36 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             width=340,
             content=ft.Column(
                 [
-                    ft.Text("Notes", size=12, color=ft.Colors.BLUE_GREY_400,
-                            weight=ft.FontWeight.W_500),
-                    notes_field,
-                    ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
-                    ft.Text("Comments", size=12, color=ft.Colors.BLUE_GREY_400,
-                            weight=ft.FontWeight.W_500),
-                    ft.Container(
-                        expand=True,
-                        content=comments_column,
+                    ft.Row(
+                        [
+                            ft.Text("Notes", size=12, color=ft.Colors.BLUE_GREY_400,
+                                    weight=ft.FontWeight.W_500, expand=True),
+                            open_notes_btn,
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    comment_input,
-                    ft.Row([add_comment_btn], alignment=ft.MainAxisAlignment.END),
+                    ft.Text("Why is this important?", size=11,
+                            color=ft.Colors.BLUE_GREY_400, italic=True),
+                    ft.Container(
+                        bgcolor=ft.Colors.BLUE_GREY_800,
+                        border_radius=6,
+                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                        content=why_preview,
+                    ),
+                    ft.Text("Notes", size=11,
+                            color=ft.Colors.BLUE_GREY_400, italic=True),
+                    ft.Container(
+                        bgcolor=ft.Colors.BLUE_GREY_800,
+                        border_radius=6,
+                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                        expand=True,
+                        content=ft.Column(
+                            [text_preview],
+                            scroll=ft.ScrollMode.AUTO,
+                            expand=True,
+                        ),
+                    ),
                 ],
                 spacing=8,
                 expand=True,
@@ -581,7 +615,6 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         )
 
         page.show_dialog(dialog)
-        _refresh_comments()
         _refresh_analyses()
 
     def _paper_card(paper: sqlite3.Row) -> ft.Draggable:

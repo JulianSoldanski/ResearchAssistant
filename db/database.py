@@ -44,13 +44,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS comments (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            paper_id     INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-            comment_text TEXT NOT NULL,
-            created_at   TEXT DEFAULT (datetime('now'))
-        );
-
         CREATE TABLE IF NOT EXISTS searches (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             raw_query       TEXT,
@@ -60,18 +53,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at      TEXT DEFAULT (datetime('now')),
             agent_workers   TEXT,            -- JSON list[WorkerOut] (NULL = single-shot)
             agent_draft     TEXT             -- synthesizer pre-critic draft
-        );
-
-        CREATE TABLE IF NOT EXISTS chapters (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            title         TEXT NOT NULL,
-            instructions  TEXT,
-            paper_ids     TEXT NOT NULL,    -- JSON array of paper IDs
-            content       TEXT NOT NULL,
-            model_used    TEXT,
-            created_at    TEXT DEFAULT (datetime('now')),
-            agent_workers TEXT,             -- JSON list[WorkerOut] (NULL = single-shot)
-            agent_draft   TEXT              -- synthesizer pre-critic draft
         );
 
         CREATE TABLE IF NOT EXISTS thesis_chapters (
@@ -88,15 +69,43 @@ def init_db(conn: sqlite3.Connection) -> None:
     # try/except so re-running on a current schema is a no-op.
     for stmt in (
         "ALTER TABLE papers ADD COLUMN notes TEXT",
+        "ALTER TABLE papers ADD COLUMN notes_text TEXT",
         "ALTER TABLE searches ADD COLUMN agent_workers TEXT",
         "ALTER TABLE searches ADD COLUMN agent_draft TEXT",
-        "ALTER TABLE chapters ADD COLUMN agent_workers TEXT",
-        "ALTER TABLE chapters ADD COLUMN agent_draft TEXT",
     ):
         try:
             conn.execute(stmt)
         except Exception:
             pass
+
+    # One-shot migration: fold legacy comments into papers.notes_text, then
+    # drop the comments table. After it runs once, the table is gone and the
+    # block below is a no-op on subsequent startups.
+    has_comments_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='comments'"
+    ).fetchone() is not None
+    if has_comments_table:
+        rows = conn.execute(
+            "SELECT paper_id, comment_text, created_at FROM comments "
+            "ORDER BY paper_id, created_at"
+        ).fetchall()
+        by_paper: dict[int, list[str]] = {}
+        for r in rows:
+            block = f"[{r['created_at']}]\n{r['comment_text']}"
+            by_paper.setdefault(r["paper_id"], []).append(block)
+        for pid, blocks in by_paper.items():
+            existing = conn.execute(
+                "SELECT notes_text FROM papers WHERE id = ?", (pid,)
+            ).fetchone()
+            existing_text = (existing["notes_text"] or "") if existing else ""
+            merged_blocks = "\n\n".join(blocks)
+            new_text = (existing_text + ("\n\n" if existing_text else "")
+                        + merged_blocks)
+            conn.execute(
+                "UPDATE papers SET notes_text = ? WHERE id = ?",
+                (new_text, pid),
+            )
+        conn.execute("DROP TABLE comments")
     conn.commit()
 
 
@@ -133,18 +142,16 @@ def set_paper_pdf_path(conn: sqlite3.Connection, paper_id: int, pdf_path: str) -
 
 
 def reset_database(conn: sqlite3.Connection) -> None:
-    """Clear papers, comments, AI cache, saved searches, and chapter drafts.
+    """Clear papers, AI cache, and saved searches.
     Settings (thesis description, writing style) preserved. The user's thesis
     chapter structure is also preserved.
     """
     conn.executescript("""
-        DELETE FROM comments;
         DELETE FROM searches;
-        DELETE FROM chapters;
         DELETE FROM ai_cache;
         DELETE FROM papers;
         DELETE FROM sqlite_sequence
-            WHERE name IN ('papers', 'comments', 'ai_cache', 'searches', 'chapters');
+            WHERE name IN ('papers', 'ai_cache', 'searches');
     """)
     conn.commit()
 
@@ -170,6 +177,7 @@ def set_priority(conn: sqlite3.Connection, paper_id: int, priority_level: int) -
 
 
 def update_paper_notes(conn: sqlite3.Connection, paper_id: int, notes: str) -> None:
+    """Updates the short 'Why is this important?' field on a paper."""
     conn.execute(
         "UPDATE papers SET notes = ?, updated_at = datetime('now') WHERE id = ?",
         (notes, paper_id)
@@ -177,25 +185,13 @@ def update_paper_notes(conn: sqlite3.Connection, paper_id: int, notes: str) -> N
     conn.commit()
 
 
-# --- Comments ---
-
-def get_comments(conn: sqlite3.Connection, paper_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM comments WHERE paper_id = ? ORDER BY created_at DESC",
-        (paper_id,)
-    ).fetchall()
-
-
-def add_comment(conn: sqlite3.Connection, paper_id: int, text: str) -> None:
+def update_paper_notes_text(conn: sqlite3.Connection, paper_id: int,
+                            notes_text: str) -> None:
+    """Updates the long-form 'Notes' field on a paper."""
     conn.execute(
-        "INSERT INTO comments (paper_id, comment_text) VALUES (?, ?)",
-        (paper_id, text)
+        "UPDATE papers SET notes_text = ?, updated_at = datetime('now') WHERE id = ?",
+        (notes_text, paper_id)
     )
-    conn.commit()
-
-
-def delete_comment(conn: sqlite3.Connection, comment_id: int) -> None:
-    conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
     conn.commit()
 
 
@@ -223,33 +219,6 @@ def get_all_searches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def delete_search(conn: sqlite3.Connection, search_id: int) -> None:
     conn.execute("DELETE FROM searches WHERE id = ?", (search_id,))
-    conn.commit()
-
-
-# --- Chapters (saved AI-drafted thesis chapters) ---
-
-def save_chapter(conn: sqlite3.Connection, title: str, instructions: str,
-                 paper_ids: list[int], content: str, model_used: str,
-                 agent_workers: str | None = None,
-                 agent_draft: str | None = None) -> int:
-    cur = conn.execute("""
-        INSERT INTO chapters (title, instructions, paper_ids, content,
-                              model_used, agent_workers, agent_draft)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (title, instructions, json.dumps(paper_ids), content, model_used,
-          agent_workers, agent_draft))
-    conn.commit()
-    return cur.lastrowid
-
-
-def get_all_chapters(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM chapters ORDER BY created_at DESC"
-    ).fetchall()
-
-
-def delete_chapter(conn: sqlite3.Connection, chapter_id: int) -> None:
-    conn.execute("DELETE FROM chapters WHERE id = ?", (chapter_id,))
     conn.commit()
 
 

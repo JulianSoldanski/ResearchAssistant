@@ -148,16 +148,7 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         if len(header_text) > 90:
             header_text = header_text[:90].rstrip() + "…"
 
-        papers_section = ft.Column(
-            [ft.Text(f"• {t}", size=11, color=ft.Colors.BLUE_GREY_200,
-                     max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-             for t in titles] or
-            [ft.Text("(none)", size=11, italic=True, color=ft.Colors.BLUE_GREY_500)],
-            spacing=2, tight=True,
-        )
-
-        # Agent-pipeline section (only if this search was run multi-agent)
-        agent_section_controls: list[ft.Control] = []
+        # Agent-pipeline data (only present if this search was run multi-agent)
         agent_workers_raw = None
         try:
             agent_workers_raw = row["agent_workers"]
@@ -169,107 +160,125 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
         except (IndexError, KeyError):
             agent_draft_raw = None
 
-        if agent_workers_raw:
-            try:
-                workers_list = json.loads(agent_workers_raw)
-            except (json.JSONDecodeError, TypeError):
-                workers_list = []
-
-            worker_tiles = []
-            for w in workers_list:
-                w_idx = w.get("batch_index", "?")
-                w_paper_idxs = w.get("paper_indices", [])
-                # Map global paper indices (1-based) to titles
-                w_titles = []
-                for global_idx in w_paper_idxs:
-                    # global_idx is 1-based position in this search's paper_id_list
-                    if 1 <= global_idx <= len(paper_id_list):
-                        pid = paper_id_list[global_idx - 1]
-                        p = db.get_paper_by_id(conn, pid)
-                        w_titles.append(
-                            f"[{global_idx}] {p['title']}" if p
-                            else f"[{global_idx}] (deleted #{pid})"
-                        )
-
-                worker_tiles.append(
-                    ft.Container(
-                        bgcolor=ft.Colors.BLUE_GREY_800,
-                        border_radius=4,
-                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
-                        content=ft.Column(
-                            [
-                                ft.Text(f"Worker {w_idx}", size=11,
-                                        color=ft.Colors.WHITE,
-                                        weight=ft.FontWeight.W_600),
-                                ft.Column(
-                                    [ft.Text(t, size=10,
-                                             color=ft.Colors.BLUE_GREY_300,
-                                             max_lines=1,
-                                             overflow=ft.TextOverflow.ELLIPSIS)
-                                     for t in w_titles],
-                                    spacing=1, tight=True,
-                                ),
-                                ft.Container(height=4),
-                                ft.Markdown(
-                                    value=w.get("output", ""),
-                                    selectable=True,
-                                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-                                ),
-                            ],
-                            spacing=2, tight=True,
-                        ),
-                    )
+        def _build_body_controls(text_scale: float = 1.0) -> list[ft.Control]:
+            # Rebuild a fresh set of controls each time — Flet controls can't be
+            # mounted in two places at once, so the inline body and the fullscreen
+            # dialog each get their own copies.
+            def _papers_block():
+                return ft.Column(
+                    [ft.Text(f"• {t}", size=int(11 * text_scale),
+                             color=ft.Colors.BLUE_GREY_200,
+                             max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+                     for t in titles] or
+                    [ft.Text("(none)", size=int(11 * text_scale), italic=True,
+                             color=ft.Colors.BLUE_GREY_500)],
+                    spacing=2, tight=True,
                 )
 
-            agent_section_controls = [
-                ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
-                ft.Text(f"Agent pipeline ({len(workers_list)} workers)", size=10,
-                        color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
-                *worker_tiles,
-            ]
-            if agent_draft_raw:
-                agent_section_controls += [
-                    ft.Text("Synthesizer draft (pre-critic)", size=10,
-                            color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
-                    ft.Container(
-                        bgcolor=ft.Colors.BLUE_GREY_800,
-                        border_radius=4,
-                        padding=ft.Padding(left=10, right=10, top=8, bottom=8),
-                        content=ft.Markdown(
-                            value=agent_draft_raw, selectable=True,
-                            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-                        ),
-                    ),
+            agents: list[ft.Control] = []
+            if agent_workers_raw:
+                try:
+                    workers_list = json.loads(agent_workers_raw)
+                except (json.JSONDecodeError, TypeError):
+                    workers_list = []
+
+                worker_tiles = []
+                for w in workers_list:
+                    w_idx = w.get("batch_index", "?")
+                    w_paper_idxs = w.get("paper_indices", [])
+                    w_titles = []
+                    for global_idx in w_paper_idxs:
+                        if 1 <= global_idx <= len(paper_id_list):
+                            pid = paper_id_list[global_idx - 1]
+                            p = db.get_paper_by_id(conn, pid)
+                            w_titles.append(
+                                f"[{global_idx}] {p['title']}" if p
+                                else f"[{global_idx}] (deleted #{pid})"
+                            )
+
+                    worker_tiles.append(
+                        ft.Container(
+                            bgcolor=ft.Colors.BLUE_GREY_800,
+                            border_radius=4,
+                            padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                            content=ft.Column(
+                                [
+                                    ft.Text(f"Worker {w_idx}",
+                                            size=int(11 * text_scale),
+                                            color=ft.Colors.WHITE,
+                                            weight=ft.FontWeight.W_600),
+                                    ft.Column(
+                                        [ft.Text(t, size=int(10 * text_scale),
+                                                 color=ft.Colors.BLUE_GREY_300,
+                                                 max_lines=1,
+                                                 overflow=ft.TextOverflow.ELLIPSIS)
+                                         for t in w_titles],
+                                        spacing=1, tight=True,
+                                    ),
+                                    ft.Container(height=4),
+                                    ft.Markdown(
+                                        value=w.get("output", ""),
+                                        selectable=True,
+                                        extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                                    ),
+                                ],
+                                spacing=2, tight=True,
+                            ),
+                        )
+                    )
+
+                agents = [
+                    ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
+                    ft.Text(f"Agent pipeline ({len(workers_list)} workers)",
+                            size=int(10 * text_scale),
+                            color=ft.Colors.BLUE_GREY_400,
+                            weight=ft.FontWeight.W_500),
+                    *worker_tiles,
                 ]
+                if agent_draft_raw:
+                    agents += [
+                        ft.Text("Synthesizer draft (pre-critic)",
+                                size=int(10 * text_scale),
+                                color=ft.Colors.BLUE_GREY_400,
+                                weight=ft.FontWeight.W_500),
+                        ft.Container(
+                            bgcolor=ft.Colors.BLUE_GREY_800,
+                            border_radius=4,
+                            padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                            content=ft.Markdown(
+                                value=agent_draft_raw, selectable=True,
+                                extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                            ),
+                        ),
+                    ]
+
+            return [
+                ft.Text("Optimized prompt", size=int(10 * text_scale),
+                        color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
+                ft.Container(
+                    bgcolor=ft.Colors.BLUE_GREY_800,
+                    border_radius=4,
+                    padding=ft.Padding(left=8, right=8, top=6, bottom=6),
+                    content=ft.Text(optimized, size=int(11 * text_scale),
+                                    color=ft.Colors.BLUE_GREY_100, selectable=True),
+                ),
+                ft.Text(f"Papers used ({len(titles)})", size=int(10 * text_scale),
+                        color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
+                _papers_block(),
+                ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
+                ft.Text("Results", size=int(10 * text_scale),
+                        color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
+                ft.Markdown(
+                    value=response, selectable=True,
+                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                ),
+                *agents,
+            ]
 
         body = ft.Container(
             padding=ft.Padding(left=10, right=10, top=0, bottom=10),
             visible=expand_by_default,
-            content=ft.Column(
-                [
-                    ft.Text("Optimized prompt", size=10,
-                            color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
-                    ft.Container(
-                        bgcolor=ft.Colors.BLUE_GREY_800,
-                        border_radius=4,
-                        padding=ft.Padding(left=8, right=8, top=6, bottom=6),
-                        content=ft.Text(optimized, size=11,
-                                        color=ft.Colors.BLUE_GREY_100, selectable=True),
-                    ),
-                    ft.Text(f"Papers used ({len(titles)})", size=10,
-                            color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
-                    papers_section,
-                    ft.Divider(height=1, color=ft.Colors.BLUE_GREY_600),
-                    ft.Text("Results", size=10,
-                            color=ft.Colors.BLUE_GREY_400, weight=ft.FontWeight.W_500),
-                    ft.Markdown(
-                        value=response, selectable=True,
-                        extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-                    ),
-                    *agent_section_controls,
-                ],
-                spacing=6, tight=True,
-            ),
+            content=ft.Column(_build_body_controls(), spacing=6, tight=True),
         )
 
         expand_icon = ft.Icon(
@@ -289,6 +298,50 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
             db.delete_search(conn, sid)
             _refresh_searches()
 
+        def _open_fullscreen(_):
+            def _close(_e=None):
+                page.pop_dialog()
+
+            dialog_width = max(900, int((page.width or 1400) * 0.92))
+            dialog_height = max(600, int((page.height or 900) * 0.88))
+
+            header_block = ft.Column(
+                [
+                    ft.Text(raw_query.strip() or optimized.strip() or "(no query)",
+                            size=15, weight=ft.FontWeight.W_600,
+                            color=ft.Colors.WHITE, selectable=True),
+                    ft.Text(f"{created_at} · {len(titles)} papers",
+                            size=11, color=ft.Colors.BLUE_GREY_400),
+                ],
+                spacing=4, tight=True, expand=True,
+            )
+
+            title_row = ft.Row(
+                [
+                    header_block,
+                    ft.IconButton(
+                        icon=ft.Icons.CLOSE, tooltip="Close", on_click=_close,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+
+            dialog = ft.AlertDialog(
+                modal=False,
+                title=title_row,
+                content=ft.Container(
+                    width=dialog_width,
+                    height=dialog_height,
+                    content=ft.Column(
+                        _build_body_controls(text_scale=1.25),
+                        spacing=10, scroll=ft.ScrollMode.AUTO, expand=True,
+                    ),
+                ),
+                actions=[ft.TextButton(content="Close", on_click=_close)],
+            )
+            page.show_dialog(dialog)
+
         header = ft.Container(
             on_click=_toggle, ink=True,
             padding=ft.Padding(left=10, right=8, top=8, bottom=8),
@@ -307,6 +360,11 @@ def build(conn: sqlite3.Connection, page: ft.Page) -> ft.Control:
                         spacing=2, tight=True, expand=True,
                     ),
                     expand_icon,
+                    ft.IconButton(
+                        icon=ft.Icons.OPEN_IN_FULL, icon_size=16,
+                        tooltip="Open fullscreen",
+                        on_click=_open_fullscreen,
+                    ),
                     ft.IconButton(
                         icon=ft.Icons.DELETE_OUTLINE, icon_size=16,
                         tooltip="Delete this search",

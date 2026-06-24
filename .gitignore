@@ -1,3 +1,4 @@
+.gitignore
 .env
 .venv/
 __pycache__/
@@ -5,3 +6,5 @@ __pycache__/
 *.db
 .claude/settings.local.json
 CLAUDE.md
+scheduled_tasks.lock
+*.pdf
